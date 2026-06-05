@@ -26,7 +26,7 @@ repos:
       - id: cargo-test
         name: cargo test
         description: Run tests.
-        entry: bash -c 'DATABASE_URL=postgres://postgres:password@localhost/cdd cargo test --workspace'
+        entry: cargo test --workspace
         language: system
         types: [rust]
         pass_filenames: false

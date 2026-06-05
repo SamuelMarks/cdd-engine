@@ -2,42 +2,20 @@ name: CI
 
 on:
   push:
-    branches: ["main", "master"]
-    tags:
-      - 'v*'
+    branches: ["master"]
   pull_request:
-    branches: ["main", "master"]
+    branches: ["master"]
 
 env:
   CARGO_TERM_COLOR: always
-  DATABASE_URL: postgres://postgres:password@localhost/cdd
 
 jobs:
   build_and_test:
     name: Build and Test
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: cdd
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev gcc libpq-dev
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,12 +24,6 @@ jobs:
 
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin
-
-      - name: Setup Database
-        run: |
-          cargo install diesel_cli --no-default-features --features postgres
-          diesel setup --database-url postgres://postgres:password@localhost/cdd
-          diesel migration run --database-url postgres://postgres:password@localhost/cdd
 
       - name: Run checks
         run: cargo check --verbose
@@ -64,58 +36,3 @@ jobs:
 
       - name: Build docs
         run: cargo doc --no-deps
-
-      - name: Build debian Docker image
-        run: docker build -t cdd-ctl:debian -f debian.Dockerfile .
-
-      - name: Build alpine Docker image
-        run: docker build -t cdd-ctl:alpine -f alpine.Dockerfile .
-
-  release:
-    name: Build & Release Binaries
-    if: startsWith(github.ref, 'refs/tags/')
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: cdd-ctl
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact_name: cdd-ctl
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: cdd-ctl
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: cdd-ctl.exe
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
-      - name: Build Binary
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v3
-        with:
-          files: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-          name: Release ${{ github.ref_name }}
-
-  update_latest_tag:
-    name: Update Latest Tag
-    needs: release
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Update latest tag (Local only, push disabled per policy)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f latest ${{ github.sha }}
-
