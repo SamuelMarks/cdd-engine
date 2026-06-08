@@ -243,6 +243,7 @@ dependencies = [
 name = "cdd-engine"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "config",
  "derive_more",
  "env_logger",

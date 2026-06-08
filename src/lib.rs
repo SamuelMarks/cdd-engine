@@ -15,4 +15,6 @@ pub mod wasm_executor;
 
 pub use config::AppConfig;
 pub use daemon::{ProcessConfig, ProcessManager};
-pub use error::CddError;
+pub use error::CddEngineError;
+/// MCP module
+pub mod mcp;

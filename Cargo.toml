@@ -15,6 +15,7 @@ once_cell = "1.21.4"
 wasmtime = "45"
 wasmtime-wasi = "45"
 rquickjs = "0.12.0"
+async-trait = "0.1.89"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

@@ -42,18 +42,18 @@ impl AppConfig {
     /// 1. Environment variables (`CDD__*`)
     /// 2. Config file (if `config_path` is `Some`)
     /// 3. Built-in defaults
-    pub fn load(config_path: Option<&str>) -> Result<Self, crate::error::CddError> {
+    pub fn load(config_path: Option<&str>) -> Result<Self, crate::error::CddEngineError> {
         let mut builder = config::Config::builder()
             .set_default("database_url", "postgres://postgres:password@localhost/cdd")
-            .map_err(|e| crate::error::CddError::Config(e.to_string()))?
+            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
             .set_default("server_bind", "0.0.0.0:8080")
-            .map_err(|e| crate::error::CddError::Config(e.to_string()))?
+            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
             .set_default("jwt_secret", "super-secret-key")
-            .map_err(|e| crate::error::CddError::Config(e.to_string()))?
+            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
             .set_default("webhook_secret", "my_webhook_secret")
-            .map_err(|e| crate::error::CddError::Config(e.to_string()))?
+            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
             .set_default("offline_mode", false)
-            .map_err(|e| crate::error::CddError::Config(e.to_string()))?;
+            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?;
 
         if let Some(path) = config_path {
             builder = builder.add_source(config::File::with_name(path).required(false));
@@ -62,9 +62,9 @@ impl AppConfig {
         builder
             .add_source(config::Environment::with_prefix("CDD").separator("__"))
             .build()
-            .map_err(|e| crate::error::CddError::Config(e.to_string()))?
+            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
             .try_deserialize()
-            .map_err(|e| crate::error::CddError::Config(e.to_string()))
+            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))
     }
 }
 
@@ -77,10 +77,10 @@ mod tests {
     static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
-    fn test_config_env_overrides() -> Result<(), crate::error::CddError> {
+    fn test_config_env_overrides() -> Result<(), crate::error::CddEngineError> {
         let _lock = ENV_MUTEX
             .lock()
-            .map_err(|e| crate::error::CddError::Config(e.to_string()))?;
+            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?;
 
         // 1. Default config
         std::env::remove_var("CDD__JWT_SECRET");
@@ -127,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_load_with_file_path() -> Result<(), crate::error::CddError> {
+    fn test_config_load_with_file_path() -> Result<(), crate::error::CddEngineError> {
         // Create a temporary file with config
         use std::io::Write;
         let file_path = "test_cdd_config.toml";
