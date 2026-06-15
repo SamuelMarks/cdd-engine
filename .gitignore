@@ -159,3 +159,18 @@ ehthumbs.db
 .idea/
 .vscode/
 *.code-workspace
+
+# ---------------------------------------------------
+# CDD Ecosystem & Careless Add Overrides
+# ---------------------------------------------------
+# Temporary planning and scratch files
+*PLAN*.md
+scratch*
+*.tmp
+
+# Common build and runtime artifacts
+build/
+target/
+node_modules/
+dist/
+.env
