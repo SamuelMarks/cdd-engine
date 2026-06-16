@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/SamuelMarks/cdd-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelMarks/cdd-engine/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Test Coverage](https://img.shields.io/badge/coverage-100%25-success.svg)](https://github.com/SamuelMarks/cdd-engine/actions)
-[![Doc Coverage](https://img.shields.io/badge/docs-100%25-success.svg)](https://github.com/SamuelMarks/cdd-engine/actions)
+[![Test Coverage](https://img.shields.io/badge/coverage-74%25-success.svg)](https://github.com/SamuelMarks/cdd-engine/actions)
+[![Doc Coverage](https://img.shields.io/badge/docs-74%25-success.svg)](https://github.com/SamuelMarks/cdd-engine/actions)
 
 The core execution engine for the `cdd-*` toolchain. 
 This crate provides the Tokio-based daemon manager for running native subprocesses and the Wasmtime-based execution environment for securely running `.wasm` generators.
