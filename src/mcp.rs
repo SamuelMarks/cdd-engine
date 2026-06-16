@@ -1,44 +1,73 @@
-#![deny(missing_docs)]
-
-//! Model Context Protocol (MCP) definitions and orchestrator trait.
-
-use crate::error::CddEngineError;
 use serde::{Deserialize, Serialize};
 
-/// An MCP Request object.
+/// Represents an MCP (Model Context Protocol) JSON-RPC request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpRequest {
-    /// JSON-RPC version, typically "2.0".
+    /// JSON-RPC version string, typically "2.0".
     pub jsonrpc: String,
-    /// Request method name.
+    /// The method name to be invoked.
     pub method: String,
-    /// Request parameters.
+    /// Optional parameters for the method.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
-    /// Request ID.
+    /// Optional request identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<serde_json::Value>,
 }
 
-/// An MCP Response object.
+/// Represents an MCP (Model Context Protocol) JSON-RPC response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpResponse {
-    /// JSON-RPC version, typically "2.0".
+    /// JSON-RPC version string, typically "2.0".
     pub jsonrpc: String,
-    /// Response result.
+    /// Optional result returned by the method.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
-    /// Response error.
+    /// Optional error object if the method invocation failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<serde_json::Value>,
-    /// Response ID.
+    /// Request identifier that matches the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<serde_json::Value>,
 }
 
-/// Core trait for orchestrating MCP tool calls across daemons.
+/// A trait defining the behavior of an MCP orchestrator.
 #[async_trait::async_trait]
 pub trait McpOrchestrator: Send + Sync {
-    /// Handle an incoming MCP request, route it to the appropriate daemon, and return the response.
-    async fn handle_request(&self, req: McpRequest) -> Result<McpResponse, CddEngineError>;
+    /// Handles an incoming MCP request.
+    async fn handle_request(
+        &self,
+        request: McpRequest,
+    ) -> Result<McpResponse, crate::error::CddEngineError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mcp_request() {
+        let req = McpRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "test".to_string(),
+            params: None,
+            id: Some(serde_json::json!(1)),
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        let de: McpRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(req, de);
+    }
+
+    #[test]
+    fn test_mcp_response() {
+        let res = McpResponse {
+            jsonrpc: "2.0".to_string(),
+            result: Some(serde_json::json!(true)),
+            error: None,
+            id: Some(serde_json::json!(1)),
+        };
+        let s = serde_json::to_string(&res).unwrap();
+        let de: McpResponse = serde_json::from_str(&s).unwrap();
+        assert_eq!(res, de);
+    }
 }

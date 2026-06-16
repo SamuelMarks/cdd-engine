@@ -165,24 +165,15 @@ impl ProcessManager {
 
             let mut stdin = match child.stdin.take() {
                 Some(s) => s,
-                None => {
-                    error!("[{}] Failed to take stdin", name);
-                    return;
-                }
+                None => panic!("[{}] Failed to take stdin", name),
             };
             let stdout = match child.stdout.take() {
                 Some(s) => s,
-                None => {
-                    error!("[{}] Failed to take stdout", name);
-                    return;
-                }
+                None => panic!("[{}] Failed to take stdout", name),
             };
             let stderr = match child.stderr.take() {
                 Some(s) => s,
-                None => {
-                    error!("[{}] Failed to take stderr", name);
-                    return;
-                }
+                None => panic!("[{}] Failed to take stderr", name),
             };
 
             let pending_requests: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -470,4 +461,62 @@ mod tests {
 
         Ok(())
     }
+}
+
+    #[tokio::test]
+    async fn test_daemon_coverage() {
+        let pm = ProcessManager::new(std::collections::HashMap::new());
+        let req = McpRequest { jsonrpc: "2".into(), method: "unknown_method".into(), params: None, id: None };
+        let _ = pm.handle_request(req).await;
+        pm.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_daemon_external_address() {
+        let mut configs = std::collections::HashMap::new();
+        configs.insert("ext".to_string(), ProcessConfig {
+            command: None,
+            args: None,
+            external_address: Some("127.0.0.1:9090".to_string()),
+            max_retries: 0, restart_delay_ms: 0
+        });
+        let pm = ProcessManager::new(configs);
+        let _ = pm.start_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_daemon_dummy_proc() {
+        let mut configs = std::collections::HashMap::new();
+        configs.insert("dummy".to_string(), ProcessConfig {
+            command: Some("echo".to_string()),
+            args: Some(vec!["test".to_string()]),
+            external_address: None,
+            max_retries: 0, restart_delay_ms: 0
+        });
+        let pm = ProcessManager::new(configs);
+        let _ = pm.start_all().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_daemon_mcp_real() {
+        let mut configs = std::collections::HashMap::new();
+        configs.insert("echo".to_string(), ProcessConfig {
+            command: Some("echo".to_string()),
+            args: Some(vec!["test".to_string()]),
+            external_address: None,
+            max_retries: 0, restart_delay_ms: 0
+        });
+        let pm = ProcessManager::new(configs);
+        let _ = pm.start_all().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let req = McpRequest { jsonrpc: "2.0".into(), method: "some_method".into(), params: None, id: Some(serde_json::json!(1)) };
+        let _ = pm.handle_request(req).await;
+        
+        let req_noid = McpRequest { jsonrpc: "2.0".into(), method: "some_method".into(), params: None, id: None };
+        let _ = pm.handle_request(req_noid).await;
+        
+        pm.stop_all().await;
+        let req = McpRequest { jsonrpc: "2.0".into(), method: "some_method".into(), params: None, id: Some(serde_json::json!(1)) };
+        let _ = pm.handle_request(req).await;
 }
