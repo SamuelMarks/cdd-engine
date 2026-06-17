@@ -234,7 +234,7 @@ impl ProcessManager {
             err_handle.abort();
 
             if *shutdown_rx.borrow() {
-                break;
+                return;
             }
 
             if start_time.elapsed() > Duration::from_millis(10) {
