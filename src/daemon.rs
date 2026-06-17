@@ -133,7 +133,7 @@ impl ProcessManager {
         };
         let mut retries = 0;
 
-        loop {
+        while !*shutdown_rx.borrow() {
             info!("[{}] Starting process: {}", name, cmd_str);
             let mut cmd = Command::new(&cmd_str);
             if let Some(args_vec) = config.args.as_ref() {
@@ -232,10 +232,6 @@ impl ProcessManager {
 
             reader_handle.abort();
             err_handle.abort();
-
-            if *shutdown_rx.borrow() {
-                return;
-            }
 
             if start_time.elapsed() > Duration::from_millis(10) {
                 info!("[{}] Process was stable. Resetting retry count.", name);
