@@ -68,4 +68,12 @@ pub enum CddEngineError {
     #[error(ignore)]
     #[from(ignore)]
     Internal(String),
+
+    /// Error originating from the Wasmtime engine.
+    #[display("Wasmtime Error: {_0}")]
+    Wasmtime(wasmtime::Error),
+
+    /// Error originating from QuickJS execution.
+    #[display("Quickjs Error: {_0}")]
+    Quickjs(rquickjs::Error),
 }

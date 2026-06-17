@@ -53,8 +53,8 @@ mod tests {
             params: None,
             id: Some(serde_json::json!(1)),
         };
-        let s = serde_json::to_string(&req).unwrap();
-        let de: McpRequest = serde_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&req).expect("test error");
+        let de: McpRequest = serde_json::from_str(&s).expect("test error");
         assert_eq!(req, de);
     }
 
@@ -66,8 +66,8 @@ mod tests {
             error: None,
             id: Some(serde_json::json!(1)),
         };
-        let s = serde_json::to_string(&res).unwrap();
-        let de: McpResponse = serde_json::from_str(&s).unwrap();
+        let s = serde_json::to_string(&res).expect("test error");
+        let de: McpResponse = serde_json::from_str(&s).expect("test error");
         assert_eq!(res, de);
     }
 }

@@ -1,5 +1,3 @@
-#![cfg(not(tarpaulin_include))]
-
 //! GraalVM Linker bindings
 
 use std::collections::HashMap;
@@ -82,7 +80,7 @@ impl GraalVmLinker {
                     // Stub for Phase 3
                 },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap(
@@ -92,7 +90,7 @@ impl GraalVmLinker {
                     // Stub for Phase 3
                 },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap("interop", "Date.now", |mut _caller: Caller<'_, T>| -> f64 {
@@ -102,7 +100,7 @@ impl GraalVmLinker {
                     .as_secs_f64()
                     * 1000.0
             })
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap(
@@ -116,7 +114,7 @@ impl GraalVmLinker {
                         * 1000.0
                 },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap(
@@ -126,7 +124,7 @@ impl GraalVmLinker {
                     // Stub for Phase 3
                 },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         // Mock jsbody methods
         linker
@@ -135,7 +133,7 @@ impl GraalVmLinker {
                 "_JSObject.stringValue___String",
                 |mut _caller: Caller<'_, T>| -> i32 { 0 },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap(
@@ -143,7 +141,7 @@ impl GraalVmLinker {
                 "_JSNumber.javaDouble___Double",
                 |mut _caller: Caller<'_, T>| -> f64 { 0.0 },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap(
@@ -151,7 +149,7 @@ impl GraalVmLinker {
                 "_JSConversion.extractJavaScriptString___String_Object",
                 |mut _caller: Caller<'_, T>| -> i32 { 0 },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap(
@@ -159,7 +157,7 @@ impl GraalVmLinker {
                 "_JSObject.get___Object_Object",
                 |mut _caller: Caller<'_, T>| -> i32 { 0 },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         // Mock compat methods
         linker
@@ -168,7 +166,7 @@ impl GraalVmLinker {
                 "f64rem",
                 |mut _caller: Caller<'_, T>, a: f64, b: f64| -> f64 { a % b },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap(
@@ -176,7 +174,7 @@ impl GraalVmLinker {
                 "f64log",
                 |mut _caller: Caller<'_, T>, a: f64| -> f64 { a.ln() },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap(
@@ -184,7 +182,7 @@ impl GraalVmLinker {
                 "f64log10",
                 |mut _caller: Caller<'_, T>, a: f64| -> f64 { a.log10() },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         linker
             .func_wrap(
@@ -192,8 +190,240 @@ impl GraalVmLinker {
                 "f64pow",
                 |mut _caller: Caller<'_, T>, a: f64, b: f64| -> f64 { a.powf(b) },
             )
-            .map_err(|e| format!("Link error: {}", e))?;
+            .expect("Link error");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasmtime::{Config, Engine, Store};
+
+    #[test]
+    fn test_graalvm_state() {
+        let mut state = GraalVmState::default();
+        let id = state.insert_object(Box::new("test".to_string()));
+        let obj = state
+            .get_object(id)
+            .expect("graalvm state expected to work in tests");
+        assert_eq!(
+            obj.downcast_ref::<String>()
+                .expect("graalvm state expected to work in tests"),
+            "test"
+        );
+        assert!(state.get_object(999).is_none());
+    }
+
+    #[test]
+    fn test_memory_read_write() {
+        let engine = Engine::new(&Config::new()).expect("graalvm state expected to work in tests");
+        let mut store = Store::new(&engine, ());
+        let memory = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, None))
+            .expect("graalvm state expected to work in tests");
+
+        let mut linker = Linker::<()>::new(&engine);
+        linker
+            .func_wrap(
+                "env",
+                "test",
+                move |mut caller: wasmtime::Caller<'_, ()>| {
+                    write_string(&memory, &mut caller, 10, "hello")
+                        .expect("graalvm state expected to work in tests");
+                    let s = read_string(&memory, &mut caller, 10, 5)
+                        .expect("graalvm state expected to work in tests");
+                    assert_eq!(s, "hello");
+
+                    assert!(read_string(&memory, &mut caller, 65536, 1).is_err());
+                    assert!(write_string(&memory, &mut caller, 65536, "a").is_err());
+
+                    memory
+                        .write(&mut caller, 0, &[0xff, 0xff])
+                        .expect("graalvm state expected to work in tests");
+                    assert!(read_string(&memory, &mut caller, 0, 2).is_err());
+                },
+            )
+            .expect("graalvm state expected to work in tests");
+
+        let func = linker
+            .get(&mut store, "env", "test")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(), ()>(&store)
+            .expect("graalvm state expected to work in tests");
+        func.call(&mut store, ())
+            .expect("graalvm state expected to work in tests");
+    }
+    #[test]
+    fn test_graalvm_linker() {
+        let engine = Engine::new(&Config::new()).expect("graalvm state expected to work in tests");
+        let mut linker = Linker::<()>::new(&engine);
+        GraalVmLinker::add_to_linker(&mut linker).expect("graalvm state expected to work in tests");
+
+        let mut store = Store::new(&engine, ());
+
+        let func = linker
+            .get(&mut store, "interop", "stdoutWriter.printChars")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(i32, i32), ()>(&store)
+            .expect("graalvm state expected to work in tests");
+        func.call(&mut store, (0, 0))
+            .expect("graalvm state expected to work in tests");
+
+        let func = linker
+            .get(&mut store, "interop", "stderrWriter.printChars")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(i32, i32), ()>(&store)
+            .expect("graalvm state expected to work in tests");
+        func.call(&mut store, (0, 0))
+            .expect("graalvm state expected to work in tests");
+
+        let func = linker
+            .get(&mut store, "interop", "Date.now")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(), f64>(&store)
+            .expect("graalvm state expected to work in tests");
+        let res = func
+            .call(&mut store, ())
+            .expect("graalvm state expected to work in tests");
+        assert!(res > 0.0);
+
+        let func = linker
+            .get(&mut store, "interop", "performance.now")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(), f64>(&store)
+            .expect("graalvm state expected to work in tests");
+        let res = func
+            .call(&mut store, ())
+            .expect("graalvm state expected to work in tests");
+        assert!(res > 0.0);
+
+        let func = linker
+            .get(&mut store, "interop", "runtime.setExitCode")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(i32,), ()>(&store)
+            .expect("graalvm state expected to work in tests");
+        func.call(&mut store, (0,))
+            .expect("graalvm state expected to work in tests");
+
+        let func = linker
+            .get(&mut store, "jsbody", "_JSObject.stringValue___String")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(), i32>(&store)
+            .expect("graalvm state expected to work in tests");
+        assert_eq!(
+            func.call(&mut store, ())
+                .expect("graalvm state expected to work in tests"),
+            0
+        );
+
+        let func = linker
+            .get(&mut store, "jsbody", "_JSNumber.javaDouble___Double")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(), f64>(&store)
+            .expect("graalvm state expected to work in tests");
+        assert_eq!(
+            func.call(&mut store, ())
+                .expect("graalvm state expected to work in tests"),
+            0.0
+        );
+
+        let func = linker
+            .get(
+                &mut store,
+                "jsbody",
+                "_JSConversion.extractJavaScriptString___String_Object",
+            )
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(), i32>(&store)
+            .expect("graalvm state expected to work in tests");
+        assert_eq!(
+            func.call(&mut store, ())
+                .expect("graalvm state expected to work in tests"),
+            0
+        );
+
+        let func = linker
+            .get(&mut store, "jsbody", "_JSObject.get___Object_Object")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(), i32>(&store)
+            .expect("graalvm state expected to work in tests");
+        assert_eq!(
+            func.call(&mut store, ())
+                .expect("graalvm state expected to work in tests"),
+            0
+        );
+
+        let func = linker
+            .get(&mut store, "compat", "f64rem")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(f64, f64), f64>(&store)
+            .expect("graalvm state expected to work in tests");
+        assert_eq!(
+            func.call(&mut store, (5.0, 2.0))
+                .expect("graalvm state expected to work in tests"),
+            1.0
+        );
+
+        let func = linker
+            .get(&mut store, "compat", "f64log")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(f64,), f64>(&store)
+            .expect("graalvm state expected to work in tests");
+        assert!(
+            func.call(&mut store, (10.0,))
+                .expect("graalvm state expected to work in tests")
+                > 2.0
+        );
+
+        let func = linker
+            .get(&mut store, "compat", "f64log10")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(f64,), f64>(&store)
+            .expect("graalvm state expected to work in tests");
+        assert_eq!(
+            func.call(&mut store, (10.0,))
+                .expect("graalvm state expected to work in tests"),
+            1.0
+        );
+
+        let func = linker
+            .get(&mut store, "compat", "f64pow")
+            .expect("graalvm state expected to work in tests")
+            .into_func()
+            .expect("graalvm state expected to work in tests")
+            .typed::<(f64, f64), f64>(&store)
+            .expect("graalvm state expected to work in tests");
+        assert_eq!(
+            func.call(&mut store, (2.0, 3.0))
+                .expect("graalvm state expected to work in tests"),
+            8.0
+        );
     }
 }

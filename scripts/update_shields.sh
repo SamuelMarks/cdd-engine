@@ -42,6 +42,6 @@ if command -v git &> /dev/null; then
 fi
 
 if [ "$COVERAGE_ROUNDED" -ne 100 ] || [ "$DOC_COVERAGE" -ne 100 ]; then
-    echo "Coverage requirement not met (74% required)."
+    echo "Coverage requirement not met (100% required)."
     exit 1
 fi

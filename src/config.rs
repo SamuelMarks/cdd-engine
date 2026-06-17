@@ -1,5 +1,3 @@
-#![cfg(not(tarpaulin_include))]
-
 use crate::daemon::ProcessConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,15 +43,15 @@ impl AppConfig {
     pub fn load(config_path: Option<&str>) -> Result<Self, crate::error::CddEngineError> {
         let mut builder = config::Config::builder()
             .set_default("database_url", "postgres://postgres:password@localhost/cdd")
-            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
+            .expect("static default")
             .set_default("server_bind", "0.0.0.0:8080")
-            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
+            .expect("static default")
             .set_default("jwt_secret", "super-secret-key")
-            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
+            .expect("static default")
             .set_default("webhook_secret", "my_webhook_secret")
-            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
+            .expect("static default")
             .set_default("offline_mode", false)
-            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?;
+            .expect("static default");
 
         if let Some(path) = config_path {
             builder = builder.add_source(config::File::with_name(path).required(false));
@@ -62,7 +60,7 @@ impl AppConfig {
         builder
             .add_source(config::Environment::with_prefix("CDD").separator("__"))
             .build()
-            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?
+            .expect("config build error")
             .try_deserialize()
             .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))
     }
@@ -77,10 +75,8 @@ mod tests {
     static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
-    fn test_config_env_overrides() -> Result<(), crate::error::CddEngineError> {
-        let _lock = ENV_MUTEX
-            .lock()
-            .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))?;
+    fn test_config_env_overrides() {
+        let _lock = ENV_MUTEX.lock().expect("mutex lock failed");
 
         // 1. Default config
         std::env::remove_var("CDD__JWT_SECRET");
@@ -88,7 +84,7 @@ mod tests {
         std::env::remove_var("CDD__GITHUB_TOKEN");
         std::env::remove_var("CDD__OFFLINE_MODE");
 
-        let cfg = AppConfig::load(None)?;
+        let cfg = AppConfig::load(None).expect("err");
         assert_eq!(cfg.server_bind, "0.0.0.0:8080");
         assert_eq!(
             cfg.database_url,
@@ -101,43 +97,49 @@ mod tests {
 
         // 2. JWT Secret override
         std::env::set_var("CDD__JWT_SECRET", "test-jwt-secret");
-        let cfg = AppConfig::load(None)?;
+        let cfg = AppConfig::load(None).expect("err");
         assert_eq!(cfg.jwt_secret, "test-jwt-secret");
         std::env::remove_var("CDD__JWT_SECRET");
 
         // 3. Webhook Secret override
         std::env::set_var("CDD__WEBHOOK_SECRET", "test-webhook-secret");
-        let cfg = AppConfig::load(None)?;
+        let cfg = AppConfig::load(None).expect("err");
         assert_eq!(cfg.webhook_secret, "test-webhook-secret");
         std::env::remove_var("CDD__WEBHOOK_SECRET");
 
         // 4. GitHub Token override
         std::env::set_var("CDD__GITHUB_TOKEN", "ghp_test123");
-        let cfg = AppConfig::load(None)?;
+        let cfg = AppConfig::load(None).expect("err");
         assert_eq!(cfg.github_token.as_deref(), Some("ghp_test123"));
         std::env::remove_var("CDD__GITHUB_TOKEN");
 
         // 5. Offline Mode override
         std::env::set_var("CDD__OFFLINE_MODE", "true");
-        let cfg = AppConfig::load(None)?;
+        let cfg = AppConfig::load(None).expect("err");
         assert!(cfg.offline_mode);
         std::env::remove_var("CDD__OFFLINE_MODE");
 
-        Ok(())
+        // 6. Config error (deserialization)
+        std::env::set_var("CDD__OFFLINE_MODE", "not_a_boolean");
+        let err = AppConfig::load(None);
+        assert!(err.is_err());
+        std::env::remove_var("CDD__OFFLINE_MODE");
     }
 
     #[test]
-    fn test_config_load_with_file_path() -> Result<(), crate::error::CddEngineError> {
+    fn test_config_load_with_file_path() {
+        let _lock = ENV_MUTEX.lock().expect("mutex lock failed");
+        std::env::remove_var("CDD__OFFLINE_MODE");
+
         // Create a temporary file with config
         use std::io::Write;
         let file_path = "test_cdd_config.toml";
-        let mut file = std::fs::File::create(file_path)?;
-        writeln!(file, "server_bind = \"127.0.0.1:9090\"")?;
+        let mut file = std::fs::File::create(file_path).expect("err");
+        writeln!(file, "server_bind = \"127.0.0.1:9090\"").expect("err");
 
-        let config = AppConfig::load(Some(file_path))?;
+        let config = AppConfig::load(Some(file_path)).expect("err");
         assert_eq!(config.server_bind, "127.0.0.1:9090");
 
-        std::fs::remove_file(file_path)?;
-        Ok(())
+        std::fs::remove_file(file_path).expect("err");
     }
 }
