@@ -44,7 +44,7 @@ impl AppConfig {
         let mut builder = config::Config::builder()
             .set_default("database_url", "postgres://postgres:password@localhost/cdd")
             .expect("static default")
-            .set_default("server_bind", "0.0.0.0:8080")
+            .set_default("server_bind", "0.0.0.0:8084")
             .expect("static default")
             .set_default("jwt_secret", "super-secret-key")
             .expect("static default")
@@ -85,7 +85,7 @@ mod tests {
         std::env::remove_var("CDD__OFFLINE_MODE");
 
         let cfg = AppConfig::load(None).expect("err");
-        assert_eq!(cfg.server_bind, "0.0.0.0:8080");
+        assert_eq!(cfg.server_bind, "0.0.0.0:8084");
         assert_eq!(
             cfg.database_url,
             "postgres://postgres:password@localhost/cdd"

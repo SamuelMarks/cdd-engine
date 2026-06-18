@@ -1,91 +1,63 @@
-# cdd-ctl Architecture
+# cdd-engine Architecture
 
-> This document details the internal technical architecture, database models, daemon manager, and WebAssembly execution engine of the `cdd-ctl` ecosystem.
+> This document details the internal technical architecture of the Daemon Manager and WebAssembly execution engine of the CDD ecosystem.
 
+`cdd-engine` serves as the core execution orchestrator for the multi-language `cdd-*` toolchain. It provides a highly concurrent, reliable foundation for managing the execution of 13+ distinct language SDKs and components, either as native subprocesses or sandboxed WebAssembly (WASM) modules.
 
-`cdd-ctl` serves as the central orchestration layer and API gateway for the multi-language `cdd-*` toolchain. Rewritten natively in Rust, it provides a highly concurrent, reliable foundation for managing the execution, synchronization, and authentication of 13+ distinct language SDKs and components.
-
-It operates primarily across three distinct layers:
-
-1. **The API Gateway (Actix Web)** - Exposing both REST and JSON-RPC interfaces.
-2. **The Database & ORM (PostgreSQL & Diesel)**
-3. **The Process & Lifecycle Daemon Manager (Tokio)**
-4. **The WASM Execution Engine (`wasmtime`)** - Evaluates language-specific payloads directly in WASM execution modes.
+As part of the broader microservice architecture (interacting with `cdd-control-plane`, `cdd-gateway`, and `cdd-web-ui`), `cdd-engine` focuses strictly on execution, logging, and lifecycle management.
 
 ## High-Level Diagram
 
 ```ascii
-                      +-------------------+
-                      |   Web UI / CLI    |
-                      +---------+---------+
-                                | (HTTP/REST / OpenAPI)
-                                v
-                      +---------+---------+
-                      |  cdd-ctl Gateway  |
-                      |   (actix-web)     |
-                      +----+---------+----+
-                           |         |
-      +--------------------+         +---------------------+
-      | (DB Queries via Diesel)                            | (Lifecycle Events / Wasmtime calls)
-      v                                                    v
-+-----+--------------+                             +-------+---------+
-| PostgreSQL DB      |                             | Daemon Manager  |
-| (Organizations,    |                             | (Tokio Tasks)   |
-|  Users, Repos,     |                             +-------+---------+
-|  Releases, RBAC)   |                                     |
-+--------------------+                                     | (Spawns & Tracks)
-                                                           v
-                           +----------------------------------------------------+
-                           |             cdd-* JSON-RPC Servers                 |
-                           |   (cdd-python, cdd-rust, cdd-go, cdd-typescript)   |
-                           +----------------------------------------------------+
+                      +-----------------------------+
+                      |   cdd-web-ui (Local Mode)   |
+                      |   or cdd-control-plane      |
+                      +-------------+---------------+
+                                    | (JSON-RPC)
+                                    v
+                      +-------------+---------------+
+                      |        cdd-engine           |
+                      | (Daemon & Wasm Orchestrator)|
+                      +----+-------------------+----+
+                           |                   |
+        +------------------+                   +-----------------------+
+        | (Lifecycle Events)                                           | (wasmtime calls)
+        v                                                              v
++-------+---------+                                          +---------+---------+
+| Daemon Manager  |                                          | WASM Executor     |
+| (tokio tasks)   |                                          | (wasmtime / WASI) |
++-------+---------+                                          +---------+---------+
+        |                                                              |
+        | (Spawns & Tracks)                                            | (Evaluates)
+        v                                                              v
++------------------------------------+               +-----------------------------------+
+|      cdd-* JSON-RPC Servers        |               |      cdd-* .wasm modules          |
+| (Native Python, Rust, Go binaries) |               | (Sandboxed generation payloads)   |
++------------------------------------+               +-----------------------------------+
 ```
 
 ## Core Subsystems
 
-### 1. The REST API Gateway (`src/api/`)
+### 1. The Daemon Manager (`src/daemon.rs`)
 
-Built upon `actix-web`, this component provides a secure, OpenAPI-compliant REST interface.
-
-- **Routing & Sync:** Provides endpoints for managing Organizations, Users, Repositories (SDKs), and Releases. Future extensions handle secret management and direct syncing with the GitHub API.
-- **Authentication:** Enforces JWT `Bearer` token auth (`src/api/auth_middleware.rs`). Issues tokens via an OAuth2 password grant flow hashed via **Argon2** and supports GitHub OAuth login stubs.
-- **OpenAPI / Swagger:** Utilizes `utoipa` to generate live OpenAPI 3.x specifications automatically from the Rust codebase. A live sandbox is exposed at `/swagger-ui/`.
-
-### 2. Database & Data Models (`src/db/`)
-
-The database layer uses `diesel` (an asynchronous-friendly ORM in Rust) wrapping a `r2d2` PostgreSQL connection pool.
-
-- **Entities:** Manages the relational mapping of `Users`, `Organizations`, `Repositories`, and `Releases`.
-- **RBAC (Role-Based Access Control):** Uses many-to-many link tables (`organization_users`) storing explicit string-based roles (e.g., `"owner"`, `"member"`) to securely gate access to mutation APIs (like `POST /repos`).
-- **Abstract Repository Pattern:** To ensure 100% test coverage and dependency inversion, `CddRepository` provides an async trait abstraction, allowing the business logic to be tested against a `mockall` mock repository without a live database.
-
-### 3. The Daemon Manager (`src/daemon.rs`)
-
-Because the ecosystem consists of diverse technology stacks (Python, Java, Go, Rust, Zig, C++, etc.), `cdd-ctl` must act as an agnostic process supervisor. Built fully on Tokio's async runtime, it acts as an embedded `initd` or `systemd`.
+Because the ecosystem consists of diverse technology stacks (Python, Java, Go, Rust, Zig, C++, etc.), `cdd-engine` acts as an agnostic process supervisor. Built fully on Tokio's async runtime, it serves as an embedded daemon supervisor.
 
 - **Concurrency:** Spawns distinct tasks for each monitored process, allowing non-blocking I/O handling.
-- **I/O Standardizing:** Captures `stdout` and `stderr` from all 13 RPC servers, tagging and logging lines securely via the unified `log` crate.
-- **Resilience:** Implements auto-restart backoffs, tracking uptime to distinguish between persistent crashes (which eventually halt retries) and sporadic failures (which reset retry counters upon stabilization).
-- **Graceful Shutdown:** Subscribes all processes to a Tokio `watch` channel to cleanly cascade termination signals across the entire language-server fleet when the main gateway stops.
+- **I/O Standardizing:** Captures `stdout` and `stderr` from the RPC servers, tagging and logging lines securely via the unified `log` crate.
+- **Resilience:** Implements auto-restart backoffs, tracking uptime to distinguish between persistent crashes and sporadic failures.
+- **Graceful Shutdown:** Subscribes all processes to cleanly cascade termination signals across the entire language-server fleet when the engine stops.
 
-### 4. Binary Targets (`src/bin/`)
+### 2. The WASM Execution Engine (`src/wasm_executor.rs`)
 
-The architecture compiles down into distinct binaries to support various deployment strategies and interface preferences:
+To support purely offline and sandboxed generation (e.g., when requested directly by the `cdd-web-ui`), `cdd-engine` uses `wasmtime` to evaluate `.wasm` builds of the supported `cdd-*` ecosystems within a robust, multi-tenant sandbox.
 
-- **`cdd-ctl`**: The default manager. Provides a REST API gateway and spawns/supervises native `cdd-*` executables as background daemons.
-- **`cdd-ctl-wasm`**: The WASM variant of the REST API gateway. Instead of spawning native daemon processes, it uses `wasmtime` to securely evaluate `.wasm` builds of the supported `cdd-*` ecosystems within a robust, multi-tenant sandbox. Unsupported targets (interpreted languages or heavy VMs) fallback to an HTTP 400 rejection.
-- **`cdd-rpc`**: Provides a JSON-RPC 2.0 over HTTP interface instead of REST, managing native `cdd-*` background daemons.
-- **`cdd-rpc-wasm`**: Provides a JSON-RPC 2.0 over HTTP interface, securely evaluating payloads via `wasmtime` against `.wasm` modules.
-- **`dump_openapi`**: A utility binary that automatically generates and exports the `openapi.json` schema from the `utoipa` definitions.
+- **WASI Integration:** Provides virtualized filesystem access and standard streams mapping.
+- **GraalVM Linker (`src/graalvm_linker.rs`):** Specifically handles complex linking requirements for Java/JVM-based generators compiled via GraalVM to WASM.
 
-### 5. Git Submodules (`sdks/`)
+### 3. Model Context Protocol (`src/mcp.rs`)
 
-Instead of relying strictly on network downloads or stale releases, the 13 `cdd-*` language SDKs are bundled as git submodules within the `sdks/` directory. This guarantees that `cdd-ctl` can reliably build and pin all child processes or WASM targets strictly to their latest `master` commits within a unified monorepo-like environment.
-
-### 6. Client-Side WASM SDK (`cdd-ctl-wasm-sdk/`)
-
-This is an isolated TypeScript/NPM package that wraps `@bjorn3/browser_wasi_shim`. It mounts virtual filesystem descriptors, parses WASM execution outputs, and allows executing the 12 fully supported standalone `.wasm` payloads (C, C++, C#, Go, Java, Kotlin, PHP, Python, Ruby, Rust, Swift, TypeScript) directly within a user's web browser, offline. Targets that cannot compile to WASM (like native shell scripts) are unsupported in this purely client-side shim and must gracefully degrade to JSON-RPC HTTP calls back to a native `cdd-ctl` container environment.
+Provides integration with the Model Context Protocol, enabling advanced context management and AI-driven interactions within the generation pipeline.
 
 ## Configuration
 
-Configurations are handled elegantly via the `config` crate, resolving environment variable overrides (`CDD__SERVER_BIND`) or falling back to defaults in a `config.json` file.
+Configurations are handled via the `config` crate (`src/config.rs`), allowing flexible deployment whether run locally by a developer using `cdd-web-ui` or hosted centrally as part of the CDD backend infrastructure.
