@@ -185,7 +185,7 @@ fn test_config_serde_defaults() -> Result<(), Box<dyn std::error::Error>> {
         "webhook_secret": "webhook"
     }"#;
     let de: AppConfig = serde_json::from_str(json)?;
-    assert_eq!(de.offline_mode, false);
+    assert!(!de.offline_mode);
     assert!(de.servers.is_empty());
     Ok(())
 }

@@ -203,13 +203,10 @@ impl WasmExecutor for NativeWasmExecutor {
             Err(_) => std::path::PathBuf::from(input),
         };
         let input_dir = input_path.parent();
-        let filename = match input_path
+        let filename = input_path
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
-        {
-            Some(s) => s,
-            None => String::new(),
-        };
+            .unwrap_or_default();
 
         let mut run_args = vec![];
         for a in args {
