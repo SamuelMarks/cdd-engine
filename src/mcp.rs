@@ -46,28 +46,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mcp_request() {
+    fn test_mcp_request() -> Result<(), crate::error::CddEngineError> {
         let req = McpRequest {
             jsonrpc: "2.0".to_string(),
             method: "test".to_string(),
             params: None,
             id: Some(serde_json::json!(1)),
         };
-        let s = serde_json::to_string(&req).expect("test error");
-        let de: McpRequest = serde_json::from_str(&s).expect("test error");
+        let s = serde_json::to_string(&req)?;
+        let de: McpRequest = serde_json::from_str(&s)?;
         assert_eq!(req, de);
+        Ok(())
     }
 
     #[test]
-    fn test_mcp_response() {
+    fn test_mcp_response() -> Result<(), crate::error::CddEngineError> {
         let res = McpResponse {
             jsonrpc: "2.0".to_string(),
             result: Some(serde_json::json!(true)),
             error: None,
             id: Some(serde_json::json!(1)),
         };
-        let s = serde_json::to_string(&res).expect("test error");
-        let de: McpResponse = serde_json::from_str(&s).expect("test error");
+        let s = serde_json::to_string(&res)?;
+        let de: McpResponse = serde_json::from_str(&s)?;
         assert_eq!(res, de);
+        Ok(())
+    }
+    #[test]
+    fn test_mcp_derives() {
+        let req = McpRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "test".to_string(),
+            params: None,
+            id: Some(serde_json::json!(1)),
+        };
+        let cloned = req.clone();
+        assert_eq!(req, cloned);
+
+        let mut different_req = req.clone();
+        different_req.method = "other".to_string();
+        assert_ne!(req, different_req);
+
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("McpRequest"));
+
+        let res = McpResponse {
+            jsonrpc: "2.0".to_string(),
+            result: Some(serde_json::json!(true)),
+            error: None,
+            id: Some(serde_json::json!(1)),
+        };
+        let cloned_res = res.clone();
+        assert_eq!(res, cloned_res);
+
+        let mut different_res = res.clone();
+        different_res.jsonrpc = "1.0".to_string();
+        assert_ne!(res, different_res);
+
+        let debug_str = format!("{:?}", res);
+        assert!(debug_str.contains("McpResponse"));
     }
 }

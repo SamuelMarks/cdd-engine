@@ -180,13 +180,19 @@ impl ProcessManager {
             let reader_handle = tokio::spawn(async move {
                 while let Ok(Some(line)) = stdout_reader.next_line().await {
                     let parsed = serde_json::from_str::<McpResponse>(&line);
-                    let res = parsed.unwrap_or_else(|_| McpResponse {
-                        jsonrpc: "2.0".to_string(),
-                        result: None,
-                        error: None,
-                        id: None,
-                    });
-                    let id_val = res.id.as_ref().unwrap_or(&serde_json::Value::Null);
+                    let res = match parsed {
+                        Ok(r) => r,
+                        Err(_) => McpResponse {
+                            jsonrpc: "2.0".to_string(),
+                            result: None,
+                            error: None,
+                            id: None,
+                        },
+                    };
+                    let id_val = match res.id.as_ref() {
+                        Some(v) => v,
+                        None => &serde_json::Value::Null,
+                    };
                     let id_str = id_val.to_string();
                     let mut pending = pending_clone.lock().await;
 
@@ -210,7 +216,7 @@ impl ProcessManager {
                                 let json = serde_json::to_string(&req).expect("json");
                                 let msg = format!("{}\n", json);
                                 let write_res = stdin.write_all(msg.as_bytes()).await;
-                                write_res.unwrap_or(());
+                                let _ = write_res;
                                 let id_val = req.id.as_ref().expect("req.id is assumed to exist for standard MCP requests");
                                 pending_requests.lock().await.insert(id_val.to_string(), reply_tx);
                             }
@@ -799,4 +805,30 @@ async fn test_daemon_mcp_response_coverage() {
     let res = pm.handle_request(req).await;
     assert!(res.is_ok());
     pm.stop_all().await;
+}
+
+#[tokio::test]
+async fn test_daemon_shutdown_flow() {
+    let config = ProcessConfig {
+        command: Some("sh".to_string()),
+        args: Some(vec!["-c".to_string(), "sleep 10".to_string()]),
+        external_address: None,
+        max_retries: 0,
+        restart_delay_ms: 10,
+    };
+    let (_tx, rx) = mpsc::channel(1);
+    let (watch_tx, watch_rx) = watch::channel(false);
+
+    let handle = tokio::spawn(ProcessManager::monitor_process(
+        "test-shutdown".to_string(),
+        config,
+        rx,
+        watch_rx,
+    ));
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _ = watch_tx.send(true);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("shutdown test timeout");
 }

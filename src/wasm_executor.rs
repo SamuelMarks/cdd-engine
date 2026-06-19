@@ -122,9 +122,10 @@ impl NativeWasmExecutor {
         args: &[String],
         wasm_file_override: Option<&str>,
     ) -> Result<(Vec<u8>, Vec<u8>), crate::error::CddEngineError> {
-        let wasm_file = wasm_file_override
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("cdd-ctl-wasm-sdk/assets/wasm/{}.wasm", target));
+        let wasm_file = match wasm_file_override.map(|s| s.to_string()) {
+            Some(s) => s,
+            None => format!("cdd-ctl-wasm-sdk/assets/wasm/{}.wasm", target),
+        };
         let module = self.get_module(&wasm_file)?;
 
         let mut linker: Linker<WasiP1Ctx> = Linker::new(&self.engine);
@@ -197,14 +198,18 @@ impl WasmExecutor for NativeWasmExecutor {
         input: &str,
         args: &[String],
     ) -> Result<Vec<u8>, crate::error::CddEngineError> {
-        let input_path = std::path::Path::new(input)
-            .canonicalize()
-            .unwrap_or_else(|_| std::path::PathBuf::from(input));
+        let input_path = match std::path::Path::new(input).canonicalize() {
+            Ok(p) => p,
+            Err(_) => std::path::PathBuf::from(input),
+        };
         let input_dir = input_path.parent();
-        let filename = input_path
+        let filename = match input_path
             .file_name()
             .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
+        {
+            Some(s) => s,
+            None => String::new(),
+        };
 
         let mut run_args = vec![];
         for a in args {
@@ -373,5 +378,17 @@ mod tests {
         // cover trap (non I32Exit error)
         let trap = exec.run_wasi("target", None, false, &[], Some("dummy_trap.wasm"));
         assert!(trap.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_wasm_executor_invalid_paths() {
+        let exec = NativeWasmExecutor::new().expect("test init");
+        // Invalid path
+        let res1 = exec.execute_to_stdout("python", "does_not_exist_file.wasm", &[]);
+        assert!(res1.is_err());
+
+        // Path with no file name, like "/" or "."
+        let res2 = exec.execute_to_stdout("python", "/", &[]);
+        assert!(res2.is_err());
     }
 }

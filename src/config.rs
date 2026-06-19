@@ -42,16 +42,11 @@ impl AppConfig {
     /// 3. Built-in defaults
     pub fn load(config_path: Option<&str>) -> Result<Self, crate::error::CddEngineError> {
         let mut builder = config::Config::builder()
-            .set_default("database_url", "postgres://postgres:password@localhost/cdd")
-            .expect("static default")
-            .set_default("server_bind", "0.0.0.0:8084")
-            .expect("static default")
-            .set_default("jwt_secret", "super-secret-key")
-            .expect("static default")
-            .set_default("webhook_secret", "my_webhook_secret")
-            .expect("static default")
-            .set_default("offline_mode", false)
-            .expect("static default");
+            .set_default("database_url", "postgres://postgres:password@localhost/cdd")?
+            .set_default("server_bind", "0.0.0.0:8084")?
+            .set_default("jwt_secret", "super-secret-key")?
+            .set_default("webhook_secret", "my_webhook_secret")?
+            .set_default("offline_mode", false)?;
 
         if let Some(path) = config_path {
             builder = builder.add_source(config::File::with_name(path).required(false));
@@ -59,8 +54,7 @@ impl AppConfig {
 
         builder
             .add_source(config::Environment::with_prefix("CDD").separator("__"))
-            .build()
-            .expect("config build error")
+            .build()?
             .try_deserialize()
             .map_err(|e| crate::error::CddEngineError::Config(e.to_string()))
     }
@@ -75,8 +69,8 @@ mod tests {
     static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
-    fn test_config_env_overrides() {
-        let _lock = ENV_MUTEX.lock().expect("mutex lock failed");
+    fn test_config_env_overrides() -> Result<(), crate::error::CddEngineError> {
+        let _lock = ENV_MUTEX.lock().expect("mutex");
 
         // 1. Default config
         std::env::remove_var("CDD__JWT_SECRET");
@@ -84,7 +78,7 @@ mod tests {
         std::env::remove_var("CDD__GITHUB_TOKEN");
         std::env::remove_var("CDD__OFFLINE_MODE");
 
-        let cfg = AppConfig::load(None).expect("err");
+        let cfg = AppConfig::load(None)?;
         assert_eq!(cfg.server_bind, "0.0.0.0:8084");
         assert_eq!(
             cfg.database_url,
@@ -97,25 +91,25 @@ mod tests {
 
         // 2. JWT Secret override
         std::env::set_var("CDD__JWT_SECRET", "test-jwt-secret");
-        let cfg = AppConfig::load(None).expect("err");
+        let cfg = AppConfig::load(None)?;
         assert_eq!(cfg.jwt_secret, "test-jwt-secret");
         std::env::remove_var("CDD__JWT_SECRET");
 
         // 3. Webhook Secret override
         std::env::set_var("CDD__WEBHOOK_SECRET", "test-webhook-secret");
-        let cfg = AppConfig::load(None).expect("err");
+        let cfg = AppConfig::load(None)?;
         assert_eq!(cfg.webhook_secret, "test-webhook-secret");
         std::env::remove_var("CDD__WEBHOOK_SECRET");
 
         // 4. GitHub Token override
         std::env::set_var("CDD__GITHUB_TOKEN", "ghp_test123");
-        let cfg = AppConfig::load(None).expect("err");
+        let cfg = AppConfig::load(None)?;
         assert_eq!(cfg.github_token.as_deref(), Some("ghp_test123"));
         std::env::remove_var("CDD__GITHUB_TOKEN");
 
         // 5. Offline Mode override
         std::env::set_var("CDD__OFFLINE_MODE", "true");
-        let cfg = AppConfig::load(None).expect("err");
+        let cfg = AppConfig::load(None)?;
         assert!(cfg.offline_mode);
         std::env::remove_var("CDD__OFFLINE_MODE");
 
@@ -124,22 +118,134 @@ mod tests {
         let err = AppConfig::load(None);
         assert!(err.is_err());
         std::env::remove_var("CDD__OFFLINE_MODE");
+        Ok(())
     }
 
     #[test]
-    fn test_config_load_with_file_path() {
-        let _lock = ENV_MUTEX.lock().expect("mutex lock failed");
+    fn test_config_load_with_file_path() -> Result<(), crate::error::CddEngineError> {
+        let _lock = ENV_MUTEX.lock().expect("mutex");
         std::env::remove_var("CDD__OFFLINE_MODE");
 
         // Create a temporary file with config
         use std::io::Write;
         let file_path = "test_cdd_config.toml";
-        let mut file = std::fs::File::create(file_path).expect("err");
-        writeln!(file, "server_bind = \"127.0.0.1:9090\"").expect("err");
+        let mut file = std::fs::File::create(file_path)?;
+        writeln!(file, "server_bind = \"127.0.0.1:9090\"")?;
 
-        let config = AppConfig::load(Some(file_path)).expect("err");
+        let config = AppConfig::load(Some(file_path))?;
         assert_eq!(config.server_bind, "127.0.0.1:9090");
 
-        std::fs::remove_file(file_path).expect("err");
+        std::fs::remove_file(file_path)?;
+        Ok(())
     }
+    #[test]
+    fn test_config_derives() -> Result<(), Box<dyn std::error::Error>> {
+        let process_config = ProcessConfig {
+            command: Some("cmd".to_string()),
+            args: None,
+            external_address: None,
+            max_retries: 3,
+            restart_delay_ms: 100,
+        };
+
+        let mut different_pc = process_config.clone();
+        different_pc.command = Some("other".to_string());
+        assert_ne!(process_config, different_pc);
+        assert_eq!(process_config, process_config.clone());
+        let mut servers = HashMap::new();
+        servers.insert("test".to_string(), process_config.clone());
+
+        let config = AppConfig {
+            database_url: "url".to_string(),
+            server_bind: "bind".to_string(),
+            jwt_secret: "jwt".to_string(),
+            webhook_secret: "webhook".to_string(),
+            github_token: None,
+            offline_mode: false,
+            servers,
+        };
+        let cloned = config.clone();
+        assert_eq!(config.database_url, cloned.database_url);
+
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("AppConfig"));
+
+        let serialized = serde_json::to_string(&config)?;
+        let deserialized: AppConfig = serde_json::from_str(&serialized)?;
+        assert_eq!(deserialized.database_url, config.database_url);
+        Ok(())
+    }
+}
+#[test]
+fn test_config_serde_defaults() -> Result<(), Box<dyn std::error::Error>> {
+    let json = r#"{
+        "database_url": "url",
+        "server_bind": "bind",
+        "jwt_secret": "jwt",
+        "webhook_secret": "webhook"
+    }"#;
+    let de: AppConfig = serde_json::from_str(json)?;
+    assert_eq!(de.offline_mode, false);
+    assert!(de.servers.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_process_config_derives() {
+    use crate::daemon::ProcessConfig;
+    let config = ProcessConfig {
+        command: Some("cmd".to_string()),
+        args: None,
+        external_address: None,
+        max_retries: 3,
+        restart_delay_ms: 100,
+    };
+    let debug_str = format!("{:?}", config);
+    assert!(debug_str.contains("ProcessConfig"));
+
+    let cloned = config.clone();
+    assert_eq!(config.command, cloned.command);
+
+    let serialized = serde_json::to_string(&config).expect("json error");
+    let deserialized: ProcessConfig = serde_json::from_str(&serialized).expect("json error");
+    assert_eq!(deserialized.command, config.command);
+}
+
+#[test]
+fn test_config_serde_all_fields() {
+    let json = r#"{
+        "database_url": "url",
+        "server_bind": "bind",
+        "jwt_secret": "jwt",
+        "webhook_secret": "webhook",
+        "github_token": "token",
+        "offline_mode": true,
+        "servers": {
+            "my_server": {
+                "command": "cmd",
+                "args": ["a"],
+                "external_address": "addr",
+                "max_retries": 1,
+                "restart_delay_ms": 1
+            }
+        }
+    }"#;
+    let de: AppConfig = serde_json::from_str(json).expect("json");
+    assert_eq!(de.github_token.as_deref(), Some("token"));
+}
+
+#[test]
+fn test_config_serde_invalid_types() {
+    let json = r#"123"#;
+    let de: Result<AppConfig, _> = serde_json::from_str(json);
+    assert!(de.is_err());
+
+    let json2 = r#"[1, 2, 3]"#;
+    let de2: Result<AppConfig, _> = serde_json::from_str(json2);
+    assert!(de2.is_err());
+
+    let pc_json = r#"123"#;
+    use crate::daemon::ProcessConfig;
+    let pc_de: Result<ProcessConfig, _> = serde_json::from_str(pc_json);
+    assert!(pc_de.is_err());
 }
