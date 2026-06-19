@@ -71,9 +71,66 @@ pub enum CddEngineError {
 
     /// Error originating from the Wasmtime engine.
     #[display("Wasmtime Error: {_0}")]
-    Wasmtime(wasmtime::Error),
+    #[error(ignore)]
+    #[from(ignore)]
+    Wasmtime(String),
 
     /// Error originating from QuickJS execution.
     #[display("Quickjs Error: {_0}")]
     Quickjs(rquickjs::Error),
+}
+
+impl From<wasmtime::Error> for CddEngineError {
+    fn from(e: wasmtime::Error) -> Self {
+        CddEngineError::Wasmtime(e.to_string())
+    }
+}
+
+impl<T> From<std::sync::PoisonError<T>> for CddEngineError {
+    fn from(e: std::sync::PoisonError<T>) -> Self {
+        CddEngineError::Internal(e.to_string())
+    }
+}
+
+impl From<tokio::sync::oneshot::error::RecvError> for CddEngineError {
+    fn from(e: tokio::sync::oneshot::error::RecvError) -> Self {
+        CddEngineError::Mcp(e.to_string())
+    }
+}
+
+impl From<config::ConfigError> for CddEngineError {
+    fn from(e: config::ConfigError) -> Self {
+        CddEngineError::Config(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_conversions() -> Result<(), CddEngineError> {
+        let wasm_err = wasmtime::Error::msg("test");
+        let _engine_err: CddEngineError = wasm_err.into();
+
+        let lock_res: Result<std::sync::MutexGuard<'_, ()>, _> =
+            Err(std::sync::PoisonError::new(()));
+        if let Err(e) = lock_res {
+            let _engine_err: CddEngineError = e.into();
+        }
+
+        let config_err = config::ConfigError::NotFound("test".into());
+        let _engine_err: CddEngineError = config_err.into();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_recv_error() -> Result<(), CddEngineError> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(tx);
+        if let Err(e) = rx.await {
+            let _engine_err: CddEngineError = e.into();
+        }
+        Ok(())
+    }
 }
