@@ -46,7 +46,9 @@ pub trait WasmExecutor: Send + Sync {
 
 /// Native implementation using the `wasmtime` embedded engine.
 pub struct NativeWasmExecutor {
+    /// The Wasmtime engine.
     engine: Engine,
+    /// A cache of loaded WASM modules.
     module_cache: Arc<Mutex<HashMap<String, Module>>>,
 }
 
@@ -71,6 +73,7 @@ impl NativeWasmExecutor {
         })
     }
 
+    /// Runs a python script using Pyodide via embedded QuickJS.
     fn run_python(
         &self,
         target: &str,
@@ -95,6 +98,7 @@ impl NativeWasmExecutor {
         Ok((stdout, stderr))
     }
 
+    /// Retrieves a module from the cache or loads it from disk.
     fn get_module(&self, wasm_file: &str) -> Result<Module, crate::error::CddEngineError> {
         let mut cache = self.module_cache.lock().expect("Mutex lock failed");
         if let Some(module) = cache.get(wasm_file) {
@@ -109,6 +113,7 @@ impl NativeWasmExecutor {
         Ok(module)
     }
 
+    /// Runs a WASI module with the given arguments and environment.
     fn run_wasi(
         &self,
         target: &str,
@@ -156,8 +161,13 @@ impl NativeWasmExecutor {
             })?;
 
         if let Err(err) = start.call(&mut store, ()) {
-            let msg = err.to_string();
-            if !msg.contains("exit status 0") {
+            let is_success_exit = if let Some(exit) = err.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                exit.0 == 0
+            } else {
+                false
+            };
+
+            if !is_success_exit {
                 let stderr_bytes = stderr.contents();
                 let stderr_str = String::from_utf8_lossy(&stderr_bytes);
                 return Err(crate::error::CddEngineError::Wasm(format!(
@@ -351,9 +361,17 @@ mod tests {
         let exit_1 = exec.run_wasi("target", None, false, &[], Some("dummy_fail_wasi.wasm"));
         assert!(exit_1.is_err());
 
+        // cover exit 0 explicitly
+        let exit_0 = exec.run_wasi("target", None, false, &[], Some("dummy_exit0.wasm"));
+        assert!(exit_0.is_ok());
+
         // cover instantiate failure
         let instantiate_fail =
             exec.run_wasi("target", None, false, &[], Some("dummy_bad_import.wasm"));
         assert!(instantiate_fail.is_err());
+
+        // cover trap (non I32Exit error)
+        let trap = exec.run_wasi("target", None, false, &[], Some("dummy_trap.wasm"));
+        assert!(trap.is_err());
     }
 }

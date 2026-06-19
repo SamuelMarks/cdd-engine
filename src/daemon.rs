@@ -15,9 +15,11 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 
+/// Default max retries for a process.
 fn default_max_retries() -> usize {
     5
 }
+/// Default restart delay for a process.
 fn default_restart_delay_ms() -> u64 {
     2000
 }
@@ -39,7 +41,9 @@ pub struct ProcessConfig {
     pub restart_delay_ms: u64,
 }
 
+/// A map of pending MCP requests.
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<McpResponse, CddEngineError>>>>>;
+/// A channel sender for MCP requests.
 type ChannelSender = mpsc::Sender<(
     McpRequest,
     oneshot::Sender<Result<McpResponse, CddEngineError>>,
@@ -743,20 +747,22 @@ async fn test_daemon_coverage_outer_break() {
     use crate::daemon::{ProcessConfig, ProcessManager};
     use tokio::sync::{mpsc, watch};
     let config = ProcessConfig {
-        command: Some("echo".to_string()),
-        args: Some(vec!["test".to_string()]),
+        command: Some("sh".to_string()),
+        args: Some(vec!["-c".to_string(), "sleep 10".to_string()]),
         external_address: None,
         max_retries: 5,
         restart_delay_ms: 0,
     };
     let (_, rx) = mpsc::channel(1);
-    let (_, watch_rx) = watch::channel(true);
+    let (watch_tx, watch_rx) = watch::channel(false);
     let handle = tokio::spawn(ProcessManager::monitor_process(
         "test_outer_break".to_string(),
         config,
         rx,
         watch_rx,
     ));
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let _ = watch_tx.send(true);
     let _ = handle.await;
 }
 #[tokio::test]

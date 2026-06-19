@@ -7,6 +7,7 @@ use wasmtime::{Caller, Linker, Memory};
 pub struct GraalVmState {
     /// Simulated JS heap for interop
     pub js_objects: HashMap<u32, Box<dyn std::any::Any + Send + Sync>>,
+    /// Next available id for js objects
     next_id: u32,
 }
 
