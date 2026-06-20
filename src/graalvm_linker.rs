@@ -46,12 +46,10 @@ pub fn read_string<T>(
     caller: &mut Caller<'_, T>,
     ptr: i32,
     len: i32,
-) -> Result<String, String> {
+) -> Result<String, crate::error::CddEngineError> {
     let mut buf = vec![0; len as usize];
-    memory
-        .read(caller, ptr as usize, &mut buf)
-        .map_err(|e| e.to_string())?;
-    String::from_utf8(buf).map_err(|e| e.to_string())
+    memory.read(caller, ptr as usize, &mut buf)?;
+    Ok(String::from_utf8(buf)?)
 }
 
 /// Helper to write a string to memory
@@ -60,10 +58,8 @@ pub fn write_string<T>(
     caller: &mut Caller<'_, T>,
     ptr: i32,
     s: &str,
-) -> Result<(), String> {
-    memory
-        .write(caller, ptr as usize, s.as_bytes())
-        .map_err(|e| e.to_string())?;
+) -> Result<(), crate::error::CddEngineError> {
+    memory.write(caller, ptr as usize, s.as_bytes())?;
     Ok(())
 }
 
@@ -72,126 +68,102 @@ pub struct GraalVmLinker;
 
 impl GraalVmLinker {
     /// Links the stubs required by GraalVM into the given linker.
-    pub fn add_to_linker<T: 'static + Send>(linker: &mut Linker<T>) -> Result<(), String> {
-        linker
-            .func_wrap(
-                "interop",
-                "stdoutWriter.printChars",
-                |mut _caller: Caller<'_, T>, _ptr: i32, _len: i32| {
-                    // Stub for Phase 3
-                },
-            )
-            .expect("Link error");
+    pub fn add_to_linker<T: 'static + Send>(
+        linker: &mut Linker<T>,
+    ) -> Result<(), crate::error::CddEngineError> {
+        linker.func_wrap(
+            "interop",
+            "stdoutWriter.printChars",
+            |mut _caller: Caller<'_, T>, _ptr: i32, _len: i32| {
+                // Stub for Phase 3
+            },
+        )?;
 
-        linker
-            .func_wrap(
-                "interop",
-                "stderrWriter.printChars",
-                |mut _caller: Caller<'_, T>, _ptr: i32, _len: i32| {
-                    // Stub for Phase 3
-                },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "interop",
+            "stderrWriter.printChars",
+            |mut _caller: Caller<'_, T>, _ptr: i32, _len: i32| {
+                // Stub for Phase 3
+            },
+        )?;
 
-        linker
-            .func_wrap("interop", "Date.now", |mut _caller: Caller<'_, T>| -> f64 {
+        linker.func_wrap("interop", "Date.now", |mut _caller: Caller<'_, T>| -> f64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0
+        })?;
+
+        linker.func_wrap(
+            "interop",
+            "performance.now",
+            |mut _caller: Caller<'_, T>| -> f64 {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs_f64()
                     * 1000.0
-            })
-            .expect("Link error");
+            },
+        )?;
 
-        linker
-            .func_wrap(
-                "interop",
-                "performance.now",
-                |mut _caller: Caller<'_, T>| -> f64 {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs_f64()
-                        * 1000.0
-                },
-            )
-            .expect("Link error");
-
-        linker
-            .func_wrap(
-                "interop",
-                "runtime.setExitCode",
-                |mut _caller: Caller<'_, T>, _code: i32| {
-                    // Stub for Phase 3
-                },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "interop",
+            "runtime.setExitCode",
+            |mut _caller: Caller<'_, T>, _code: i32| {
+                // Stub for Phase 3
+            },
+        )?;
 
         // Mock jsbody methods
-        linker
-            .func_wrap(
-                "jsbody",
-                "_JSObject.stringValue___String",
-                |mut _caller: Caller<'_, T>| -> i32 { 0 },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "jsbody",
+            "_JSObject.stringValue___String",
+            |mut _caller: Caller<'_, T>| -> i32 { 0 },
+        )?;
 
-        linker
-            .func_wrap(
-                "jsbody",
-                "_JSNumber.javaDouble___Double",
-                |mut _caller: Caller<'_, T>| -> f64 { 0.0 },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "jsbody",
+            "_JSNumber.javaDouble___Double",
+            |mut _caller: Caller<'_, T>| -> f64 { 0.0 },
+        )?;
 
-        linker
-            .func_wrap(
-                "jsbody",
-                "_JSConversion.extractJavaScriptString___String_Object",
-                |mut _caller: Caller<'_, T>| -> i32 { 0 },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "jsbody",
+            "_JSConversion.extractJavaScriptString___String_Object",
+            |mut _caller: Caller<'_, T>| -> i32 { 0 },
+        )?;
 
-        linker
-            .func_wrap(
-                "jsbody",
-                "_JSObject.get___Object_Object",
-                |mut _caller: Caller<'_, T>| -> i32 { 0 },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "jsbody",
+            "_JSObject.get___Object_Object",
+            |mut _caller: Caller<'_, T>| -> i32 { 0 },
+        )?;
 
         // Mock compat methods
-        linker
-            .func_wrap(
-                "compat",
-                "f64rem",
-                |mut _caller: Caller<'_, T>, a: f64, b: f64| -> f64 { a % b },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "compat",
+            "f64rem",
+            |mut _caller: Caller<'_, T>, a: f64, b: f64| -> f64 { a % b },
+        )?;
 
-        linker
-            .func_wrap(
-                "compat",
-                "f64log",
-                |mut _caller: Caller<'_, T>, a: f64| -> f64 { a.ln() },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "compat",
+            "f64log",
+            |mut _caller: Caller<'_, T>, a: f64| -> f64 { a.ln() },
+        )?;
 
-        linker
-            .func_wrap(
-                "compat",
-                "f64log10",
-                |mut _caller: Caller<'_, T>, a: f64| -> f64 { a.log10() },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "compat",
+            "f64log10",
+            |mut _caller: Caller<'_, T>, a: f64| -> f64 { a.log10() },
+        )?;
 
-        linker
-            .func_wrap(
-                "compat",
-                "f64pow",
-                |mut _caller: Caller<'_, T>, a: f64, b: f64| -> f64 { a.powf(b) },
-            )
-            .expect("Link error");
+        linker.func_wrap(
+            "compat",
+            "f64pow",
+            |mut _caller: Caller<'_, T>, a: f64, b: f64| -> f64 { a.powf(b) },
+        )?;
 
         Ok(())
     }
@@ -257,6 +229,42 @@ mod tests {
         func.call(&mut store, ())
             .expect("graalvm state expected to work in tests");
     }
+    #[test]
+    fn test_graalvm_linker_errors() {
+        let engine = Engine::new(&Config::new()).expect("graalvm state expected to work in tests");
+        let funcs = vec![
+            ("interop", "stdoutWriter.printChars"),
+            ("interop", "stderrWriter.printChars"),
+            ("interop", "Date.now"),
+            ("interop", "performance.now"),
+            ("interop", "runtime.setExitCode"),
+            ("jsbody", "_JSObject.stringValue___String"),
+            ("jsbody", "_JSNumber.javaDouble___Double"),
+            (
+                "jsbody",
+                "_JSConversion.extractJavaScriptString___String_Object",
+            ),
+            ("jsbody", "_JSObject.get___Object_Object"),
+            ("compat", "f64rem"),
+            ("compat", "f64log"),
+            ("compat", "f64log10"),
+            ("compat", "f64pow"),
+        ];
+
+        for func in funcs.into_iter() {
+            let mut store = wasmtime::Store::new(&engine, ());
+            let mut linker = Linker::<()>::new(&engine);
+            let global = wasmtime::Global::new(
+                &mut store,
+                wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Const),
+                wasmtime::Val::I32(0),
+            )
+            .expect("test");
+            let _ = linker.define(&mut store, func.0, func.1, global);
+            assert!(GraalVmLinker::add_to_linker(&mut linker).is_err());
+        }
+    }
+
     #[test]
     fn test_graalvm_linker() {
         let engine = Engine::new(&Config::new()).expect("graalvm state expected to work in tests");

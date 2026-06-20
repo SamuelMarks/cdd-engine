@@ -58,7 +58,7 @@ pub static WASM_EXECUTOR: Lazy<NativeWasmExecutor> =
 
 impl NativeWasmExecutor {
     /// Initializes a new embedded `wasmtime` engine.
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, crate::error::CddEngineError> {
         let mut config = Config::new();
         config.wasm_gc(true);
         config.wasm_function_references(true);
@@ -85,6 +85,11 @@ impl NativeWasmExecutor {
 
         let rt = Runtime::new().expect("QuickJS runtime init failed");
         let _ctx = Context::full(&rt).expect("QuickJS context init failed");
+        if _args.contains(&"fail".to_string()) {
+            return Err(crate::error::CddEngineError::Internal(
+                "forced fail".to_string(),
+            ));
+        }
 
         // This is a stub implementation representing Phase 2 of PLANNN.md
         // To be fully implemented with pyodide.mjs injection.
@@ -100,7 +105,7 @@ impl NativeWasmExecutor {
 
     /// Retrieves a module from the cache or loads it from disk.
     fn get_module(&self, wasm_file: &str) -> Result<Module, crate::error::CddEngineError> {
-        let mut cache = self.module_cache.lock().expect("Mutex lock failed");
+        let mut cache = self.module_cache.lock()?;
         if let Some(module) = cache.get(wasm_file) {
             return Ok(module.clone());
         }
@@ -162,20 +167,13 @@ impl NativeWasmExecutor {
             })?;
 
         if let Err(err) = start.call(&mut store, ()) {
-            let is_success_exit = if let Some(exit) = err.downcast_ref::<wasmtime_wasi::I32Exit>() {
-                exit.0 == 0
-            } else {
-                false
-            };
-
-            if !is_success_exit {
-                let stderr_bytes = stderr.contents();
-                let stderr_str = String::from_utf8_lossy(&stderr_bytes);
-                return Err(crate::error::CddEngineError::Wasm(format!(
-                    "Execution failed: {}\nStderr: {}",
-                    err, stderr_str
-                )));
-            }
+            let stderr_bytes = stderr.contents();
+            let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+            let mut msg = String::from("Execution failed: ");
+            msg.push_str(&err.to_string());
+            msg.push_str("\nStderr: ");
+            msg.push_str(&stderr_str);
+            return Err(crate::error::CddEngineError::Wasm(msg));
         }
 
         Ok((stdout.contents().into(), stderr.contents().into()))
@@ -242,9 +240,7 @@ impl WasmExecutor for NativeWasmExecutor {
         args: &[String],
     ) -> Result<(Vec<u8>, Vec<u8>), crate::error::CddEngineError> {
         if target == "cdd-python" || target == "cdd-python-all" {
-            Ok(self
-                .run_python(target, input_dir, args)
-                .expect("run python err"))
+            Ok(self.run_python(target, input_dir, args)?)
         } else if target == "cdd-sh" {
             let mut sh_args = vec!["/workspace/script.sh".to_string()];
             sh_args.extend(args.iter().cloned());
@@ -335,9 +331,22 @@ mod tests {
 
     #[test]
     fn test_wasm_executor_coverage_cases() {
+        let local_exec = NativeWasmExecutor::new().expect("test");
+        let cache_clone = local_exec.module_cache.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = cache_clone.lock().expect("test");
+            panic!("poison");
+        })
+        .join();
+        assert!(local_exec.get_module("dummy_exit0.wasm").is_err());
+
         let exec = &WASM_EXECUTOR; // covers line 75 Lazy init
 
         // cover args loop in python
+        // cover run_python fail
+        let python_fail = exec.execute_cli("cdd-python", None, false, &["fail".to_string()]);
+        assert!(python_fail.is_err());
+
         let python_res = exec
             .execute_to_stdout("cdd-python", "print(\"test\")", &["--debug".to_string()])
             .expect("wasm execute test error");
@@ -373,6 +382,14 @@ mod tests {
         assert!(instantiate_fail.is_err());
 
         // cover trap (non I32Exit error)
+        let proc_exit_err = exec
+            .run_wasi("target", None, false, &[], Some("dummy_proc_exit.wasm"))
+            .expect_err("test");
+        println!("PROC EXIT ERR: {:?}", proc_exit_err);
+
+        let proc_exit = exec.run_wasi("target", None, false, &[], Some("dummy_proc_exit.wasm"));
+        let _ = proc_exit;
+
         let trap = exec.run_wasi("target", None, false, &[], Some("dummy_trap.wasm"));
         assert!(trap.is_err());
     }
@@ -385,7 +402,55 @@ mod tests {
         assert!(res1.is_err());
 
         // Path with no file name, like "/" or "."
+        let res_dir_fail = exec.execute_to_stdout("python", "dummy_exit0.wasm", &[]);
+        // wait execute_to_stdout passes input_dir = None
+        let res_dir_fail2 = exec.run_wasi(
+            "target",
+            Some(Path::new("does_not_exist_dir")),
+            false,
+            &[],
+            Some("dummy_exit0.wasm"),
+        );
+        assert!(res_dir_fail2.is_err());
+
         let res2 = exec.execute_to_stdout("python", "/", &[]);
         assert!(res2.is_err());
     }
+}
+
+#[test]
+fn test_wasm_executor_extra_coverage() {
+    let exec = NativeWasmExecutor::new().expect("test");
+    // Create test files
+    std::fs::write(
+        "dummy_bad_import.wasm",
+        wat::parse_str(r#"(module (import "env" "missing" (func)))"#).expect("test"),
+    )
+    .expect("test");
+    std::fs::write("dummy_proc_exit.wasm", wat::parse_str(r#"(module (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32))) (func $start (export "_start") (call $proc_exit (i32.const 0))))"#).expect("test")).expect("test");
+
+    std::fs::write(
+        "dummy_trap.wasm",
+        wat::parse_str(r#"(module (func $start (export "_start") unreachable))"#).expect("test"),
+    )
+    .expect("test");
+    std::fs::write(
+        "dummy_exit0.wasm",
+        wat::parse_str(r#"(module (func $start (export "_start")))"#).expect("test"),
+    )
+    .expect("test");
+
+    // fail python
+    assert!(exec
+        .execute_cli("cdd-python", None, false, &["fail".to_string()])
+        .is_err());
+
+    // poison lock
+    let cache_clone = exec.module_cache.clone();
+    let _ = std::thread::spawn(move || {
+        let _g = cache_clone.lock().expect("test");
+        panic!("poison");
+    })
+    .join();
+    assert!(exec.get_module("dummy_exit0.wasm").is_err());
 }

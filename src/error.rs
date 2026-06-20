@@ -134,3 +134,15 @@ mod tests {
         Ok(())
     }
 }
+
+impl From<wasmtime::MemoryAccessError> for CddEngineError {
+    fn from(e: wasmtime::MemoryAccessError) -> Self {
+        CddEngineError::Wasmtime(e.to_string())
+    }
+}
+
+impl From<std::string::FromUtf8Error> for CddEngineError {
+    fn from(e: std::string::FromUtf8Error) -> Self {
+        CddEngineError::Validation(e.to_string())
+    }
+}

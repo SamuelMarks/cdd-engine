@@ -19,6 +19,7 @@ async-trait = "0.1.89"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+wat = "1.252.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)', 'cfg(tarpaulin)'] }
