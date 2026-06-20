@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Represents an MCP (Model Context Protocol) JSON-RPC request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpRequest {
     /// JSON-RPC version string, typically "2.0".
     pub jsonrpc: String,
@@ -16,7 +16,7 @@ pub struct McpRequest {
 }
 
 /// Represents an MCP (Model Context Protocol) JSON-RPC response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpResponse {
     /// JSON-RPC version string, typically "2.0".
     pub jsonrpc: String,
@@ -43,6 +43,7 @@ pub trait McpOrchestrator: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
 
     #[test]

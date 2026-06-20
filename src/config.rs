@@ -1,4 +1,5 @@
 use crate::daemon::ProcessConfig;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -62,11 +63,13 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
-    use once_cell::sync::Lazy;
+
+    use std::io::Write;
     use std::sync::Mutex;
 
-    static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static ENV_MUTEX: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn test_config_env_overrides() -> Result<(), crate::error::CddEngineError> {
@@ -127,7 +130,7 @@ mod tests {
         std::env::remove_var("CDD__OFFLINE_MODE");
 
         // Create a temporary file with config
-        use std::io::Write;
+
         let file_path = "test_cdd_config.toml";
         let mut file = std::fs::File::create(file_path)?;
         writeln!(file, "server_bind = \"127.0.0.1:9090\"")?;
@@ -153,7 +156,7 @@ mod tests {
         assert_ne!(process_config, different_pc);
         assert_eq!(process_config, process_config.clone());
         let mut servers = HashMap::new();
-        servers.insert("test".to_string(), process_config.clone());
+        servers.insert("test".to_string(), process_config);
 
         let config = AppConfig {
             database_url: "url".to_string(),
@@ -192,7 +195,6 @@ fn test_config_serde_defaults() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_process_config_derives() {
-    use crate::daemon::ProcessConfig;
     let config = ProcessConfig {
         command: Some("cmd".to_string()),
         args: None,
@@ -236,16 +238,17 @@ fn test_config_serde_all_fields() {
 
 #[test]
 fn test_config_serde_invalid_types() {
-    let json = r#"123"#;
+    use crate::daemon::ProcessConfig;
+    let json = r"123";
     let de: Result<AppConfig, _> = serde_json::from_str(json);
     assert!(de.is_err());
 
-    let json2 = r#"[1, 2, 3]"#;
+    let json2 = r"[1, 2, 3]";
     let de2: Result<AppConfig, _> = serde_json::from_str(json2);
     assert!(de2.is_err());
 
-    let pc_json = r#"123"#;
-    use crate::daemon::ProcessConfig;
+    let pc_json = r"123";
+
     let pc_de: Result<ProcessConfig, _> = serde_json::from_str(pc_json);
     assert!(pc_de.is_err());
 }

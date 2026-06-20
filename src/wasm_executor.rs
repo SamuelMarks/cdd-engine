@@ -1,4 +1,3 @@
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -53,8 +52,10 @@ pub struct NativeWasmExecutor {
 }
 
 /// A globally shared instance of the native WASM executor.
-pub static WASM_EXECUTOR: Lazy<NativeWasmExecutor> =
-    Lazy::new(|| NativeWasmExecutor::new().expect("Failed to initialize WASM engine"));
+pub static WASM_EXECUTOR: std::sync::LazyLock<NativeWasmExecutor> =
+    std::sync::LazyLock::new(|| {
+        NativeWasmExecutor::new().expect("Failed to initialize WASM engine")
+    });
 
 impl NativeWasmExecutor {
     /// Initializes a new embedded `wasmtime` engine.
@@ -73,7 +74,7 @@ impl NativeWasmExecutor {
         })
     }
 
-    /// Runs a python script using Pyodide via embedded QuickJS.
+    /// Runs a python script using Pyodide via embedded `QuickJS`.
     fn run_python(
         &self,
         target: &str,
@@ -127,7 +128,7 @@ impl NativeWasmExecutor {
         args: &[String],
         wasm_file_override: Option<&str>,
     ) -> Result<(Vec<u8>, Vec<u8>), crate::error::CddEngineError> {
-        let wasm_file = match wasm_file_override.map(|s| s.to_string()) {
+        let wasm_file = match wasm_file_override.map(std::string::ToString::to_string) {
             Some(s) => s,
             None => format!("cdd-ctl-wasm-sdk/assets/wasm/{}.wasm", target),
         };
@@ -151,7 +152,7 @@ impl NativeWasmExecutor {
                 .expect("err");
         }
 
-        let mut wasi_args = vec![wasm_file.clone()];
+        let mut wasi_args = vec![wasm_file];
         wasi_args.extend(args.iter().cloned());
         builder.args(&wasi_args);
 
@@ -258,6 +259,7 @@ impl WasmExecutor for NativeWasmExecutor {
 }
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
 
     #[test]
@@ -265,7 +267,7 @@ mod tests {
         let exec = NativeWasmExecutor::new().expect("wasm execute test error");
 
         // test get_module caches
-        let wasm_file = "dummy_wasi.wasm";
+        let wasm_file = "tests/fixtures/dummy_wasi.wasm";
         let _m1 = exec.get_module(wasm_file).expect("wasm execute test error");
         let _m2 = exec.get_module(wasm_file).expect("wasm execute test error"); // from cache
 
@@ -324,7 +326,13 @@ mod tests {
 
         // mount current dir
         let (stdout, _) = exec
-            .run_wasi("target", None, true, &[], Some("dummy_wasi.wasm"))
+            .run_wasi(
+                "target",
+                None,
+                true,
+                &[],
+                Some("tests/fixtures/dummy_wasi.wasm"),
+            )
             .expect("wasm execute test error");
         assert!(String::from_utf8_lossy(&stdout).contains("Hello"));
     }
@@ -338,7 +346,9 @@ mod tests {
             panic!("poison");
         })
         .join();
-        assert!(local_exec.get_module("dummy_exit0.wasm").is_err());
+        assert!(local_exec
+            .get_module("tests/fixtures/dummy_exit0.wasm")
+            .is_err());
 
         let exec = &WASM_EXECUTOR; // covers line 75 Lazy init
 
@@ -360,37 +370,78 @@ mod tests {
             Some(std::path::Path::new("invalid_dir_that_doesnt_exist_1234")),
             true,
             &[],
-            Some("dummy_wasi.wasm"),
+            Some("tests/fixtures/dummy_wasi.wasm"),
         );
         assert!(bad_dir.is_err());
 
         // cover missing _start
-        let missing_start = exec.run_wasi("target", None, false, &[], Some("dummy_lib.wasm"));
+        let missing_start = exec.run_wasi(
+            "target",
+            None,
+            false,
+            &[],
+            Some("tests/fixtures/dummy_lib.wasm"),
+        );
         assert!(missing_start.is_err());
 
         // cover exit 1
-        let exit_1 = exec.run_wasi("target", None, false, &[], Some("dummy_fail_wasi.wasm"));
+        let exit_1 = exec.run_wasi(
+            "target",
+            None,
+            false,
+            &[],
+            Some("tests/fixtures/dummy_fail_wasi.wasm"),
+        );
         assert!(exit_1.is_err());
 
         // cover exit 0 explicitly
-        let exit_0 = exec.run_wasi("target", None, false, &[], Some("dummy_exit0.wasm"));
+        let exit_0 = exec.run_wasi(
+            "target",
+            None,
+            false,
+            &[],
+            Some("tests/fixtures/dummy_exit0.wasm"),
+        );
         assert!(exit_0.is_ok());
 
         // cover instantiate failure
-        let instantiate_fail =
-            exec.run_wasi("target", None, false, &[], Some("dummy_bad_import.wasm"));
+        let instantiate_fail = exec.run_wasi(
+            "target",
+            None,
+            false,
+            &[],
+            Some("tests/fixtures/dummy_bad_import.wasm"),
+        );
         assert!(instantiate_fail.is_err());
 
         // cover trap (non I32Exit error)
         let proc_exit_err = exec
-            .run_wasi("target", None, false, &[], Some("dummy_proc_exit.wasm"))
+            .run_wasi(
+                "target",
+                None,
+                false,
+                &[],
+                Some("tests/fixtures/dummy_proc_exit.wasm"),
+            )
             .expect_err("test");
         println!("PROC EXIT ERR: {:?}", proc_exit_err);
 
-        let proc_exit = exec.run_wasi("target", None, false, &[], Some("dummy_proc_exit.wasm"));
+        let proc_exit = exec.run_wasi(
+            "target",
+            None,
+            false,
+            &[],
+            Some("tests/fixtures/dummy_proc_exit.wasm"),
+        );
         let _ = proc_exit;
 
-        let trap = exec.run_wasi("target", None, false, &[], Some("dummy_trap.wasm"));
+        let trap = exec.run_wasi(
+            "target",
+            None,
+            false,
+            &[],
+            Some("tests/fixtures/dummy_trap.wasm"),
+        );
         assert!(trap.is_err());
     }
 
@@ -402,14 +453,15 @@ mod tests {
         assert!(res1.is_err());
 
         // Path with no file name, like "/" or "."
-        let res_dir_fail = exec.execute_to_stdout("python", "dummy_exit0.wasm", &[]);
+        let _res_dir_fail =
+            exec.execute_to_stdout("python", "tests/fixtures/dummy_exit0.wasm", &[]);
         // wait execute_to_stdout passes input_dir = None
         let res_dir_fail2 = exec.run_wasi(
             "target",
             Some(Path::new("does_not_exist_dir")),
             false,
             &[],
-            Some("dummy_exit0.wasm"),
+            Some("tests/fixtures/dummy_exit0.wasm"),
         );
         assert!(res_dir_fail2.is_err());
 
@@ -423,19 +475,19 @@ fn test_wasm_executor_extra_coverage() {
     let exec = NativeWasmExecutor::new().expect("test");
     // Create test files
     std::fs::write(
-        "dummy_bad_import.wasm",
+        "tests/fixtures/dummy_bad_import.wasm",
         wat::parse_str(r#"(module (import "env" "missing" (func)))"#).expect("test"),
     )
     .expect("test");
-    std::fs::write("dummy_proc_exit.wasm", wat::parse_str(r#"(module (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32))) (func $start (export "_start") (call $proc_exit (i32.const 0))))"#).expect("test")).expect("test");
+    std::fs::write("tests/fixtures/dummy_proc_exit.wasm", wat::parse_str(r#"(module (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32))) (func $start (export "_start") (call $proc_exit (i32.const 0))))"#).expect("test")).expect("test");
 
     std::fs::write(
-        "dummy_trap.wasm",
+        "tests/fixtures/dummy_trap.wasm",
         wat::parse_str(r#"(module (func $start (export "_start") unreachable))"#).expect("test"),
     )
     .expect("test");
     std::fs::write(
-        "dummy_exit0.wasm",
+        "tests/fixtures/dummy_exit0.wasm",
         wat::parse_str(r#"(module (func $start (export "_start")))"#).expect("test"),
     )
     .expect("test");
@@ -452,5 +504,5 @@ fn test_wasm_executor_extra_coverage() {
         panic!("poison");
     })
     .join();
-    assert!(exec.get_module("dummy_exit0.wasm").is_err());
+    assert!(exec.get_module("tests/fixtures/dummy_exit0.wasm").is_err());
 }

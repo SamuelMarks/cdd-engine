@@ -16,16 +16,16 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 
 /// Default max retries for a process.
-fn default_max_retries() -> usize {
+const fn default_max_retries() -> usize {
     5
 }
 /// Default restart delay for a process.
-fn default_restart_delay_ms() -> u64 {
+const fn default_restart_delay_ms() -> u64 {
     2000
 }
 
 /// Configuration for a single managed process.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessConfig {
     /// Command to run.
     pub command: Option<String>,
@@ -62,7 +62,8 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
-    /// Create a new ProcessManager from configurations.
+    /// Create a new `ProcessManager` from configurations.
+    #[must_use]
     pub fn new(configs: HashMap<String, ProcessConfig>) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         Self {
@@ -332,6 +333,7 @@ impl McpOrchestrator for ProcessManager {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
 
     #[tokio::test]
@@ -363,7 +365,7 @@ mod tests {
         );
         let pm = ProcessManager::new(configs);
         let _ = pm.start_all().await;
-        let _ = pm.stop_all().await;
+        let () = pm.stop_all().await;
     }
 
     #[tokio::test]

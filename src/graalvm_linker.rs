@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use wasmtime::{Caller, Linker, Memory};
 
-/// State object to hold JS mock references for GraalVM.
+/// State object to hold JS mock references for `GraalVM`.
 pub struct GraalVmState {
     /// Simulated JS heap for interop
     pub js_objects: HashMap<u32, Box<dyn std::any::Any + Send + Sync>>,
@@ -19,6 +19,7 @@ impl Default for GraalVmState {
 
 impl GraalVmState {
     /// Creates a new `GraalVmState`.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             js_objects: HashMap::new(),
@@ -35,6 +36,7 @@ impl GraalVmState {
     }
 
     /// Retrieves a mock JS object from state.
+    #[must_use]
     pub fn get_object(&self, id: u32) -> Option<&(dyn std::any::Any + Send + Sync)> {
         self.js_objects.get(&id).map(|b| &**b)
     }
@@ -63,11 +65,11 @@ pub fn write_string<T>(
     Ok(())
 }
 
-/// Linker implementation for GraalVM `jsbody` and `interop`.
+/// Linker implementation for `GraalVM` `jsbody` and `interop`.
 pub struct GraalVmLinker;
 
 impl GraalVmLinker {
-    /// Links the stubs required by GraalVM into the given linker.
+    /// Links the stubs required by `GraalVM` into the given linker.
     pub fn add_to_linker<T: 'static + Send>(
         linker: &mut Linker<T>,
     ) -> Result<(), crate::error::CddEngineError> {
@@ -171,6 +173,7 @@ impl GraalVmLinker {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
     use wasmtime::{Config, Engine, Store};
 
@@ -251,7 +254,7 @@ mod tests {
             ("compat", "f64pow"),
         ];
 
-        for func in funcs.into_iter() {
+        for func in funcs {
             let mut store = wasmtime::Store::new(&engine, ());
             let mut linker = Linker::<()>::new(&engine);
             let global = wasmtime::Global::new(

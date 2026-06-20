@@ -75,41 +75,54 @@ pub enum CddEngineError {
     #[from(ignore)]
     Wasmtime(String),
 
-    /// Error originating from QuickJS execution.
+    /// Error originating from `QuickJS` execution.
     #[display("Quickjs Error: {_0}")]
     Quickjs(rquickjs::Error),
 }
 
 impl From<wasmtime::Error> for CddEngineError {
     fn from(e: wasmtime::Error) -> Self {
-        CddEngineError::Wasmtime(e.to_string())
+        Self::Wasmtime(e.to_string())
     }
 }
 
 impl<T> From<std::sync::PoisonError<T>> for CddEngineError {
     fn from(e: std::sync::PoisonError<T>) -> Self {
-        CddEngineError::Internal(e.to_string())
+        Self::Internal(e.to_string())
     }
 }
 
 impl From<tokio::sync::oneshot::error::RecvError> for CddEngineError {
     fn from(e: tokio::sync::oneshot::error::RecvError) -> Self {
-        CddEngineError::Mcp(e.to_string())
+        Self::Mcp(e.to_string())
     }
 }
 
 impl From<config::ConfigError> for CddEngineError {
     fn from(e: config::ConfigError) -> Self {
-        CddEngineError::Config(e.to_string())
+        Self::Config(e.to_string())
+    }
+}
+
+impl From<wasmtime::MemoryAccessError> for CddEngineError {
+    fn from(e: wasmtime::MemoryAccessError) -> Self {
+        Self::Wasmtime(e.to_string())
+    }
+}
+
+impl From<std::string::FromUtf8Error> for CddEngineError {
+    fn from(e: std::string::FromUtf8Error) -> Self {
+        Self::Validation(e.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
 
     #[test]
-    fn test_error_conversions() -> Result<(), CddEngineError> {
+    fn test_error_conversions() {
         let wasm_err = wasmtime::Error::msg("test");
         let _engine_err: CddEngineError = wasm_err.into();
 
@@ -121,7 +134,6 @@ mod tests {
 
         let config_err = config::ConfigError::NotFound("test".into());
         let _engine_err: CddEngineError = config_err.into();
-        Ok(())
     }
 
     #[tokio::test]
@@ -131,18 +143,7 @@ mod tests {
         if let Err(e) = rx.await {
             let _engine_err: CddEngineError = e.into();
         }
+
         Ok(())
-    }
-}
-
-impl From<wasmtime::MemoryAccessError> for CddEngineError {
-    fn from(e: wasmtime::MemoryAccessError) -> Self {
-        CddEngineError::Wasmtime(e.to_string())
-    }
-}
-
-impl From<std::string::FromUtf8Error> for CddEngineError {
-    fn from(e: std::string::FromUtf8Error) -> Self {
-        CddEngineError::Validation(e.to_string())
     }
 }
