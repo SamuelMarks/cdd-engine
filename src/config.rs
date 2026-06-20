@@ -9,7 +9,7 @@ use std::collections::HashMap;
 /// (double underscore as separator), e.g. `CDD__JWT_SECRET=mysecret`.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AppConfig {
-    /// PostgreSQL connection URL (env: `CDD__DATABASE_URL`).
+    /// `PostgreSQL` connection URL (env: `CDD__DATABASE_URL`).
     pub database_url: String,
     /// Address and port the HTTP server binds to (env: `CDD__SERVER_BIND`).
     pub server_bind: String,
@@ -25,7 +25,7 @@ pub struct AppConfig {
     /// Optional GitHub personal access token used as a system-level fallback
     /// when no per-user token is available (env: `CDD__GITHUB_TOKEN`).
     pub github_token: Option<String>,
-    /// When `true` the server starts without a PostgreSQL connection and uses
+    /// When `true` the server starts without a `PostgreSQL` connection and uses
     /// an in-memory no-op repository instead (env: `CDD__OFFLINE_MODE`).
     #[serde(default)]
     pub offline_mode: bool,
