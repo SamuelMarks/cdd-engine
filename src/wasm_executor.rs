@@ -168,13 +168,21 @@ impl NativeWasmExecutor {
             })?;
 
         if let Err(err) = start.call(&mut store, ()) {
-            let stderr_bytes = stderr.contents();
-            let stderr_str = String::from_utf8_lossy(&stderr_bytes);
-            let mut msg = String::from("Execution failed: ");
-            msg.push_str(&err.to_string());
-            msg.push_str("\nStderr: ");
-            msg.push_str(&stderr_str);
-            return Err(crate::error::CddEngineError::Wasm(msg));
+            let is_success_exit = if let Some(exit) = err.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                exit.0 == 0
+            } else {
+                false
+            };
+
+            if !is_success_exit {
+                let stderr_bytes = stderr.contents();
+                let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+                let mut msg = String::from("Execution failed: ");
+                msg.push_str(&err.to_string());
+                msg.push_str("\nStderr: ");
+                msg.push_str(&stderr_str);
+                return Err(crate::error::CddEngineError::Wasm(msg));
+            }
         }
 
         Ok((stdout.contents().into(), stderr.contents().into()))
