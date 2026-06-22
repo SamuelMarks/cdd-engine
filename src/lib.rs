@@ -2,8 +2,6 @@
 #![deny(clippy::missing_docs_in_private_items)]
 #![allow(
     clippy::missing_errors_doc,
-    clippy::expect_used,
-    clippy::unwrap_used,
     clippy::missing_panics_doc,
     clippy::similar_names,
     clippy::significant_drop_tightening,

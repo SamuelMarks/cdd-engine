@@ -52,6 +52,7 @@ pub struct NativeWasmExecutor {
 }
 
 /// A globally shared instance of the native WASM executor.
+#[allow(clippy::expect_used)]
 pub static WASM_EXECUTOR: std::sync::LazyLock<NativeWasmExecutor> =
     std::sync::LazyLock::new(|| {
         NativeWasmExecutor::new().expect("Failed to initialize WASM engine")
@@ -66,7 +67,7 @@ impl NativeWasmExecutor {
         config.wasm_multi_memory(true);
         config.wasm_memory64(true);
 
-        let engine = Engine::new(&config).expect("Engine error");
+        let engine = Engine::new(&config)?;
 
         Ok(Self {
             engine,
@@ -84,8 +85,8 @@ impl NativeWasmExecutor {
         // Here we will embed QuickJS to orchestrate the Pyodide WebAssembly module.
         use rquickjs::{Context, Runtime};
 
-        let rt = Runtime::new().expect("QuickJS runtime init failed");
-        let _ctx = Context::full(&rt).expect("QuickJS context init failed");
+        let rt = Runtime::new().map_err(crate::error::CddEngineError::Quickjs)?;
+        let _ctx = Context::full(&rt).map_err(crate::error::CddEngineError::Quickjs)?;
         if _args.contains(&"fail".to_string()) {
             return Err(crate::error::CddEngineError::Internal(
                 "forced fail".to_string(),
@@ -135,7 +136,7 @@ impl NativeWasmExecutor {
         let module = self.get_module(&wasm_file)?;
 
         let mut linker: Linker<WasiP1Ctx> = Linker::new(&self.engine);
-        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx).expect("Failed to link WASI");
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx| ctx)?;
 
         let stdout = MemoryOutputPipe::new(1024 * 1024 * 10); // 10MB
         let stderr = MemoryOutputPipe::new(1024 * 1024 * 10);
@@ -147,9 +148,7 @@ impl NativeWasmExecutor {
             builder.preopened_dir(dir, "/workspace", DirPerms::all(), FilePerms::all())?;
         }
         if mount_current_dir {
-            builder
-                .preopened_dir(".", ".", DirPerms::all(), FilePerms::all())
-                .expect("err");
+            builder.preopened_dir(".", ".", DirPerms::all(), FilePerms::all())?;
         }
 
         let mut wasi_args = vec![wasm_file];
@@ -223,8 +222,7 @@ impl WasmExecutor for NativeWasmExecutor {
         run_args.push(format!("/workspace/{}", filename));
 
         let (stdout, _) = if target == "cdd-python" || target == "cdd-python-all" {
-            self.run_python(target, input_dir, &run_args)
-                .expect("run python err")
+            self.run_python(target, input_dir, &run_args)?
         } else if target == "cdd-sh" {
             let mut sh_args = vec!["/workspace/script.sh".to_string()];
             sh_args.extend(run_args);
@@ -476,41 +474,42 @@ mod tests {
         let res2 = exec.execute_to_stdout("python", "/", &[]);
         assert!(res2.is_err());
     }
-}
 
-#[test]
-fn test_wasm_executor_extra_coverage() {
-    let exec = NativeWasmExecutor::new().expect("test");
-    // Create test files
-    std::fs::write(
-        "tests/fixtures/dummy_bad_import.wasm",
-        wat::parse_str(r#"(module (import "env" "missing" (func)))"#).expect("test"),
-    )
-    .expect("test");
-    std::fs::write("tests/fixtures/dummy_proc_exit.wasm", wat::parse_str(r#"(module (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32))) (func $start (export "_start") (call $proc_exit (i32.const 0))))"#).expect("test")).expect("test");
+    #[test]
+    fn test_wasm_executor_extra_coverage() {
+        let exec = NativeWasmExecutor::new().expect("test");
+        // Create test files
+        std::fs::write(
+            "tests/fixtures/dummy_bad_import.wasm",
+            wat::parse_str(r#"(module (import "env" "missing" (func)))"#).expect("test"),
+        )
+        .expect("test");
+        std::fs::write("tests/fixtures/dummy_proc_exit.wasm", wat::parse_str(r#"(module (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32))) (func $start (export "_start") (call $proc_exit (i32.const 0))))"#).expect("test")).expect("test");
 
-    std::fs::write(
-        "tests/fixtures/dummy_trap.wasm",
-        wat::parse_str(r#"(module (func $start (export "_start") unreachable))"#).expect("test"),
-    )
-    .expect("test");
-    std::fs::write(
-        "tests/fixtures/dummy_exit0.wasm",
-        wat::parse_str(r#"(module (func $start (export "_start")))"#).expect("test"),
-    )
-    .expect("test");
+        std::fs::write(
+            "tests/fixtures/dummy_trap.wasm",
+            wat::parse_str(r#"(module (func $start (export "_start") unreachable))"#)
+                .expect("test"),
+        )
+        .expect("test");
+        std::fs::write(
+            "tests/fixtures/dummy_exit0.wasm",
+            wat::parse_str(r#"(module (func $start (export "_start")))"#).expect("test"),
+        )
+        .expect("test");
 
-    // fail python
-    assert!(exec
-        .execute_cli("cdd-python", None, false, &["fail".to_string()])
-        .is_err());
+        // fail python
+        assert!(exec
+            .execute_cli("cdd-python", None, false, &["fail".to_string()])
+            .is_err());
 
-    // poison lock
-    let cache_clone = exec.module_cache.clone();
-    let _ = std::thread::spawn(move || {
-        let _g = cache_clone.lock().expect("test");
-        panic!("poison");
-    })
-    .join();
-    assert!(exec.get_module("tests/fixtures/dummy_exit0.wasm").is_err());
+        // poison lock
+        let cache_clone = exec.module_cache.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = cache_clone.lock().expect("test");
+            panic!("poison");
+        })
+        .join();
+        assert!(exec.get_module("tests/fixtures/dummy_exit0.wasm").is_err());
+    }
 }

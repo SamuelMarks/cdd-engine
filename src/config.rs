@@ -63,7 +63,7 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
     use super::*;
 
     use std::io::Write;
@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn test_config_env_overrides() -> Result<(), crate::error::CddEngineError> {
-        let _lock = ENV_MUTEX.lock().expect("mutex");
+        let _lock = ENV_MUTEX.lock()?;
 
         // 1. Default config
         std::env::remove_var("CDD__JWT_SECRET");
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_config_load_with_file_path() -> Result<(), crate::error::CddEngineError> {
-        let _lock = ENV_MUTEX.lock().expect("mutex");
+        let _lock = ENV_MUTEX.lock()?;
         std::env::remove_var("CDD__OFFLINE_MODE");
 
         // Create a temporary file with config
@@ -194,7 +194,7 @@ fn test_config_serde_defaults() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_process_config_derives() {
+fn test_process_config_derives() -> Result<(), crate::error::CddEngineError> {
     let config = ProcessConfig {
         command: Some("cmd".to_string()),
         args: None,
@@ -208,13 +208,14 @@ fn test_process_config_derives() {
     let cloned = config.clone();
     assert_eq!(config.command, cloned.command);
 
-    let serialized = serde_json::to_string(&config).expect("json error");
-    let deserialized: ProcessConfig = serde_json::from_str(&serialized).expect("json error");
+    let serialized = serde_json::to_string(&config)?;
+    let deserialized: ProcessConfig = serde_json::from_str(&serialized)?;
     assert_eq!(deserialized.command, config.command);
+    Ok(())
 }
 
 #[test]
-fn test_config_serde_all_fields() {
+fn test_config_serde_all_fields() -> Result<(), crate::error::CddEngineError> {
     let json = r#"{
         "database_url": "url",
         "server_bind": "bind",
@@ -232,8 +233,9 @@ fn test_config_serde_all_fields() {
             }
         }
     }"#;
-    let de: AppConfig = serde_json::from_str(json).expect("json");
+    let de: AppConfig = serde_json::from_str(json)?;
     assert_eq!(de.github_token.as_deref(), Some("token"));
+    Ok(())
 }
 
 #[test]

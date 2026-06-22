@@ -101,7 +101,7 @@ impl ProcessManager {
             let shutdown_rx = self.shutdown_tx.subscribe();
 
             let handle = tokio::spawn(async move {
-                Self::monitor_process(name_clone, config_clone, rx, shutdown_rx).await;
+                let _ = Self::monitor_process(name_clone, config_clone, rx, shutdown_rx).await;
             });
 
             handles.insert(name.clone(), handle);
@@ -131,10 +131,10 @@ impl ProcessManager {
             oneshot::Sender<Result<McpResponse, CddEngineError>>,
         )>,
         mut shutdown_rx: watch::Receiver<bool>,
-    ) {
+    ) -> Result<(), crate::error::CddEngineError> {
         let cmd_str = match &config.command {
             Some(c) => c.clone(),
-            None => return,
+            None => return Ok(()),
         };
         let mut retries = 0;
 
@@ -160,7 +160,7 @@ impl ProcessManager {
                             "[{}] Max retries ({}) reached. Giving up.",
                             name, config.max_retries
                         );
-                        return;
+                        return Ok(());
                     }
                     retries += 1;
                     tokio::time::sleep(Duration::from_millis(config.restart_delay_ms)).await;
@@ -168,9 +168,18 @@ impl ProcessManager {
                 }
             };
 
-            let mut stdin = child.stdin.take().expect("Failed to take stdin");
-            let stdout = child.stdout.take().expect("Failed to take stdout");
-            let stderr = child.stderr.take().expect("Failed to take stderr");
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| CddEngineError::ProcessSpawn("Failed to take stdin".into()))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| CddEngineError::ProcessSpawn("Failed to take stdout".into()))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| CddEngineError::ProcessSpawn("Failed to take stderr".into()))?;
 
             let pending_requests: PendingMap = Arc::new(Mutex::new(HashMap::new()));
             let pending_clone = pending_requests.clone();
@@ -214,11 +223,15 @@ impl ProcessManager {
                     req_opt = mcp_rx.recv() => {
                         match req_opt {
                             Some((req, reply_tx)) => {
-                                let json = serde_json::to_string(&req).expect("json");
+                                let json = serde_json::to_string(&req)
+                                    .map_err(|e| CddEngineError::Mcp(format!("Serialization failed: {}", e)))?;
                                 let msg = format!("{}\n", json);
                                 let write_res = stdin.write_all(msg.as_bytes()).await;
                                 let _ = write_res;
-                                let id_val = req.id.as_ref().expect("req.id is assumed to exist for standard MCP requests");
+                                let Some(id_val) = req.id.as_ref() else {
+                                    error!("[{}] req.id is missing for standard MCP requests", name);
+                                    continue;
+                                };
                                 pending_requests.lock().await.insert(id_val.to_string(), reply_tx);
                             }
                             None => break
@@ -235,7 +248,7 @@ impl ProcessManager {
                             info!("[{}] Shutdown signaled. Killing process.", name);
                             let _ = child.kill().await;
                             let _ = child.wait().await;
-                            return;
+                            return Ok(());
                         }
                     }
                 }
@@ -264,6 +277,7 @@ impl ProcessManager {
             );
             tokio::time::sleep(Duration::from_millis(config.restart_delay_ms)).await;
         }
+        Ok(())
     }
 }
 
@@ -317,11 +331,13 @@ impl McpOrchestrator for ProcessManager {
                 .ok_or_else(|| CddEngineError::NotFound(format!("Daemon not found: {}", target)))?;
 
             let (reply_tx, reply_rx) = oneshot::channel();
-            tx.send((req.clone(), reply_tx))
-                .await
-                .map_err(|_| CddEngineError::ProcessSpawn("Channel closed".into()))?;
+            if tx.send((req.clone(), reply_tx)).await.is_err() {
+                return Err(CddEngineError::ProcessSpawn("Channel closed".into()));
+            }
 
-            return reply_rx.await.expect("Daemon dropped response");
+            return reply_rx
+                .await
+                .map_err(|e| CddEngineError::Mcp(e.to_string()))?;
         }
 
         Err(CddEngineError::Validation(format!(
@@ -347,7 +363,7 @@ mod tests {
             restart_delay_ms: 0,
         };
         let (_, mcp_rx) = mpsc::channel(1);
-        ProcessManager::monitor_process("test".to_string(), config, mcp_rx, rx).await;
+        let _ = ProcessManager::monitor_process("test".to_string(), config, mcp_rx, rx).await;
     }
 
     #[tokio::test]
@@ -441,396 +457,469 @@ mod tests {
     }
 }
 
-#[tokio::test]
-async fn test_daemon_coverage() {
-    let pm = ProcessManager::new(std::collections::HashMap::new());
-    let req = McpRequest {
-        jsonrpc: "2".into(),
-        method: "unknown_method".into(),
-        params: None,
-        id: None,
-    };
-    let _ = pm.handle_request(req).await;
-    pm.stop_all().await;
-}
+#[cfg(test)]
+mod more_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
 
-#[tokio::test]
-async fn test_daemon_external_address() {
-    let mut configs = std::collections::HashMap::new();
-    configs.insert(
-        "ext".to_string(),
-        ProcessConfig {
-            command: None,
-            args: None,
-            external_address: Some("127.0.0.1:9090".to_string()),
-            max_retries: 0,
-            restart_delay_ms: 0,
-        },
-    );
-    let pm = ProcessManager::new(configs);
-    let _ = pm.start_all().await;
-}
+    #[tokio::test]
+    async fn test_daemon_coverage() {
+        let pm = ProcessManager::new(std::collections::HashMap::new());
+        let req = McpRequest {
+            jsonrpc: "2".into(),
+            method: "unknown_method".into(),
+            params: None,
+            id: None,
+        };
+        let _ = pm.handle_request(req).await;
+        pm.stop_all().await;
+    }
 
-#[tokio::test]
-async fn test_daemon_dummy_proc() {
-    let mut configs = std::collections::HashMap::new();
-    configs.insert(
-        "dummy".to_string(),
-        ProcessConfig {
-            command: Some("echo".to_string()),
-            args: Some(vec!["test".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 0,
-        },
-    );
-    let pm = ProcessManager::new(configs);
-    let _ = pm.start_all().await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-}
+    #[tokio::test]
+    async fn test_daemon_external_address() {
+        let mut configs = std::collections::HashMap::new();
+        configs.insert(
+            "ext".to_string(),
+            ProcessConfig {
+                command: None,
+                args: None,
+                external_address: Some("127.0.0.1:9090".to_string()),
+                max_retries: 0,
+                restart_delay_ms: 0,
+            },
+        );
+        let pm = ProcessManager::new(configs);
+        let _ = pm.start_all().await;
+    }
 
-#[tokio::test]
-async fn test_daemon_mcp_real() {
-    let mut configs = std::collections::HashMap::new();
-    configs.insert(
-        "echo".to_string(),
-        ProcessConfig {
-            command: Some("echo".to_string()),
-            args: Some(vec!["test".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 0,
-        },
-    );
-    let pm = ProcessManager::new(configs);
-    let _ = pm.start_all().await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    let req = McpRequest {
-        jsonrpc: "2.0".into(),
-        method: "some_method".into(),
-        params: None,
-        id: Some(serde_json::json!(1)),
-    };
-    let _ = pm.handle_request(req).await;
+    #[tokio::test]
+    async fn test_daemon_dummy_proc() {
+        let mut configs = std::collections::HashMap::new();
+        configs.insert(
+            "dummy".to_string(),
+            ProcessConfig {
+                command: Some("echo".to_string()),
+                args: Some(vec!["test".to_string()]),
+                external_address: None,
+                max_retries: 0,
+                restart_delay_ms: 0,
+            },
+        );
+        let pm = ProcessManager::new(configs);
+        let _ = pm.start_all().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
 
-    let req_noid = McpRequest {
-        jsonrpc: "2.0".into(),
-        method: "some_method".into(),
-        params: None,
-        id: None,
-    };
-    let _ = pm.handle_request(req_noid).await;
-
-    pm.stop_all().await;
-    let req = McpRequest {
-        jsonrpc: "2.0".into(),
-        method: "some_method".into(),
-        params: None,
-        id: Some(serde_json::json!(1)),
-    };
-    let _ = pm.handle_request(req).await;
-}
-
-#[tokio::test]
-async fn test_daemon_coverage_cases() {
-    use crate::mcp::McpRequest;
-    use tokio::sync::{mpsc, oneshot, watch};
-
-    let config_fail = ProcessConfig {
-        command: Some("does_not_exist_xyz123".to_string()),
-        args: Some(vec![]),
-        external_address: None,
-        max_retries: 1,
-        restart_delay_ms: 10,
-    };
-    let (_, rx) = mpsc::channel(1);
-    let (_, watch_rx) = watch::channel(false);
-    let handle = tokio::spawn(ProcessManager::monitor_process(
-        "test1".to_string(),
-        config_fail,
-        rx,
-        watch_rx,
-    ));
-    let _ = handle.await;
-
-    let config_succ = ProcessConfig {
-        command: Some("sh".to_string()),
-        args: Some(vec![
-            "-c".to_string(),
-            "echo '{\"jsonrpc\": \"2.0\", \"id\": 1}' >&1; echo \"non-json-line\" >&2; exit 0"
-                .to_string(),
-        ]),
-        external_address: None,
-        max_retries: 0,
-        restart_delay_ms: 10,
-    };
-    let (tx, rx) = mpsc::channel(1);
-    let (watch_tx, watch_rx) = watch::channel(false);
-    let handle2 = tokio::spawn(ProcessManager::monitor_process(
-        "test2".to_string(),
-        config_succ,
-        rx,
-        watch_rx.clone(),
-    ));
-
-    let _ = watch_tx.send(true); // hit shutdown branch
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let req = McpRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::Value::Number(1.into())),
-        method: "test".to_string(),
-        params: None,
-    };
-    let _ = tx.send((req.clone(), reply_tx)).await;
-
-    let _ = reply_rx.await;
-    let _ = handle2.await;
-
-    let config_succ2 = ProcessConfig {
-        command: Some("sh".to_string()),
-        args: Some(vec!["-c".to_string(), "sleep 1".to_string()]),
-        external_address: None,
-        max_retries: 0,
-        restart_delay_ms: 10,
-    };
-    let (tx2, rx2) = mpsc::channel(1);
-    let (_, watch_rx2) = watch::channel(false);
-    let handle3 = tokio::spawn(ProcessManager::monitor_process(
-        "test3".to_string(),
-        config_succ2,
-        rx2,
-        watch_rx2,
-    ));
-
-    let (reply_tx2, _) = oneshot::channel();
-    let req_no_id = McpRequest {
-        jsonrpc: "2.0".to_string(),
-        id: None,
-        method: "test".to_string(),
-        params: None,
-    };
-    let _ = tx2.send((req_no_id, reply_tx2)).await;
-
-    // Wait, hit channel drop
-    drop(tx2);
-
-    // write broken pipe
-    let (tx3, rx3) = mpsc::channel(1);
-    let (_, watch_rx3) = watch::channel(false);
-    let handle4 = tokio::spawn(ProcessManager::monitor_process(
-        "test4".to_string(),
-        ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "exit 1".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 10,
-        },
-        rx3,
-        watch_rx3,
-    ));
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    let (reply_tx3, _) = oneshot::channel();
-    let req3 = McpRequest {
-        jsonrpc: "2.0".to_string(),
-        id: Some(serde_json::Value::Number(3.into())),
-        method: "test".to_string(),
-        params: None,
-    };
-    let _ = tx3.send((req3, reply_tx3)).await;
-
-    let _ = handle3.await;
-    let _ = handle4.await;
-
-    // Hit "Channel closed" in handle_request map_err
-    let req_closed = McpRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "tools/call".to_string(),
-        params: Some(serde_json::json!({
-            "arguments": {
-                "target_language": "closed_target"
-            }
-        })),
-        id: Some(serde_json::json!(1)),
-    };
-
-    // pm handles channels directly, need a dropped one
-    let mut configs_closed = std::collections::HashMap::new();
-    configs_closed.insert(
-        "cdd-closed_target".to_string(),
-        ProcessConfig {
+    #[tokio::test]
+    async fn test_daemon_dropped_response() {
+        let config = ProcessConfig {
             command: Some("sh".to_string()),
             args: Some(vec!["-c".to_string(), "exit 0".to_string()]),
             external_address: None,
             max_retries: 0,
             restart_delay_ms: 0,
-        },
-    );
-    let pm_closed = ProcessManager::new(configs_closed);
-    pm_closed.start_all().await.expect("start");
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await; // let it exit
-    let res_closed = pm_closed.handle_request(req_closed.clone()).await;
-    assert!(res_closed.is_err());
+        };
+        let mut configs = HashMap::new();
+        configs.insert("drop-test".to_string(), config);
+        let pm = ProcessManager::new(configs);
+        let _ = pm.start_all().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-    // write broken pipe directly to the child's channel
-    let (tx5, rx5) = mpsc::channel(1);
-    let (_, watch_rx5) = watch::channel(false);
-    let handle5 = tokio::spawn(ProcessManager::monitor_process(
-        "test5".to_string(),
-        ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "exit 1".to_string()]),
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "arguments": {
+                    "target_language": "drop-test"
+                }
+            })),
+            id: Some(serde_json::json!(101)),
+        };
+        let res = pm.handle_request(req).await;
+        assert!(res.is_err());
+        pm.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_daemon_mcp_real() {
+        let mut configs = std::collections::HashMap::new();
+        configs.insert(
+            "echo".to_string(),
+            ProcessConfig {
+                command: Some("echo".to_string()),
+                args: Some(vec!["test".to_string()]),
+                external_address: None,
+                max_retries: 0,
+                restart_delay_ms: 0,
+            },
+        );
+        let pm = ProcessManager::new(configs);
+        let _ = pm.start_all().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            method: "some_method".into(),
+            params: None,
+            id: Some(serde_json::json!(1)),
+        };
+        let _ = pm.handle_request(req).await;
+
+        let req_noid = McpRequest {
+            jsonrpc: "2.0".into(),
+            method: "some_method".into(),
+            params: None,
+            id: None,
+        };
+        let _ = pm.handle_request(req_noid).await;
+
+        pm.stop_all().await;
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            method: "some_method".into(),
+            params: None,
+            id: Some(serde_json::json!(1)),
+        };
+        let _ = pm.handle_request(req).await;
+    }
+
+    #[tokio::test]
+    async fn test_daemon_coverage_cases() {
+        use crate::mcp::McpRequest;
+        use tokio::sync::{mpsc, oneshot, watch};
+
+        let config_fail = ProcessConfig {
+            command: Some("does_not_exist_xyz123".to_string()),
+            args: Some(vec![]),
             external_address: None,
-            max_retries: 0,
+            max_retries: 1,
             restart_delay_ms: 10,
-        },
-        rx5,
-        watch_rx5,
-    ));
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    let (reply_tx5, _) = oneshot::channel();
-    let _ = tx5.send((req_closed.clone(), reply_tx5)).await;
-    let _ = handle5.await;
+        };
+        let (_, rx) = mpsc::channel(1);
+        let (_, watch_rx) = watch::channel(false);
+        let handle = tokio::spawn(ProcessManager::monitor_process(
+            "test1".to_string(),
+            config_fail,
+            rx,
+            watch_rx,
+        ));
+        let _ = handle.await;
 
-    pm_closed.stop_all().await;
-}
-
-#[tokio::test]
-async fn test_coverage_for_mcp_unmatched_id_and_timeout() {
-    let config = ProcessConfig {
-        command: Some("sh".to_string()),
-        args: Some(vec!["-c".to_string(), "sleep 0.1 && exit 0".to_string()]),
-        external_address: None,
-        max_retries: 0,
-        restart_delay_ms: 10,
-    };
-    let (_tx, rx) = tokio::sync::mpsc::channel(1);
-    let (_watch_tx, watch_rx) = tokio::sync::watch::channel(false);
-
-    let handle = tokio::spawn(ProcessManager::monitor_process(
-        "test-cov".to_string(),
-        config,
-        rx,
-        watch_rx,
-    ));
-
-    // Test sending something while the process shuts down to hit branches
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    // We expect the handle to return now.
-    let _ = handle.await;
-}
-
-#[tokio::test]
-async fn test_hit_none_branch_stdin() {
-    let config = ProcessConfig {
-        command: Some("sh".to_string()),
-        args: Some(vec!["-c".to_string(), "sleep 5".to_string()]),
-        external_address: None,
-        max_retries: 0,
-        restart_delay_ms: 10,
-    };
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let (watch_tx, watch_rx) = tokio::sync::watch::channel(false);
-
-    let handle = tokio::spawn(ProcessManager::monitor_process(
-        "test-stdin".to_string(),
-        config,
-        rx,
-        watch_rx,
-    ));
-
-    // drop the sender to send None
-    drop(tx);
-
-    // give it a moment to process the drop, then signal shutdown to prevent hanging
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let _ = watch_tx.send(true);
-
-    let _ = handle.await;
-}
-#[tokio::test]
-async fn test_daemon_coverage_outer_break() {
-    use crate::daemon::{ProcessConfig, ProcessManager};
-    use tokio::sync::{mpsc, watch};
-    let config = ProcessConfig {
-        command: Some("sh".to_string()),
-        args: Some(vec!["-c".to_string(), "sleep 10".to_string()]),
-        external_address: None,
-        max_retries: 5,
-        restart_delay_ms: 0,
-    };
-    let (_, rx) = mpsc::channel(1);
-    let (watch_tx, watch_rx) = watch::channel(false);
-    let handle = tokio::spawn(ProcessManager::monitor_process(
-        "test_outer_break".to_string(),
-        config,
-        rx,
-        watch_rx,
-    ));
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    let _ = watch_tx.send(true);
-    let _ = handle.await;
-}
-#[tokio::test]
-async fn test_daemon_mcp_response_coverage() {
-    use crate::daemon::{ProcessConfig, ProcessManager};
-    use crate::mcp::McpRequest;
-    let mut configs = std::collections::HashMap::new();
-    configs.insert(
-        "cdd-responder".to_string(),
-        ProcessConfig {
+        let config_succ = ProcessConfig {
             command: Some("sh".to_string()),
             args: Some(vec![
                 "-c".to_string(),
-                "read line; echo '{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}'".to_string(),
+                "echo '{\"jsonrpc\": \"2.0\", \"id\": 1}' >&1; echo \"non-json-line\" >&2; exit 0"
+                    .to_string(),
             ]),
             external_address: None,
             max_retries: 0,
+            restart_delay_ms: 10,
+        };
+        let (tx, rx) = mpsc::channel(1);
+        let (watch_tx, watch_rx) = watch::channel(false);
+        let handle2 = tokio::spawn(ProcessManager::monitor_process(
+            "test2".to_string(),
+            config_succ,
+            rx,
+            watch_rx.clone(),
+        ));
+
+        let _ = watch_tx.send(true); // hit shutdown branch
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let req = McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::Value::Number(1.into())),
+            method: "test".to_string(),
+            params: None,
+        };
+        let _ = tx.send((req.clone(), reply_tx)).await;
+
+        let _ = reply_rx.await;
+        let _ = handle2.await;
+
+        let config_succ2 = ProcessConfig {
+            command: Some("sh".to_string()),
+            args: Some(vec!["-c".to_string(), "sleep 1".to_string()]),
+            external_address: None,
+            max_retries: 0,
+            restart_delay_ms: 10,
+        };
+        let (tx2, rx2) = mpsc::channel(1);
+        let (_, watch_rx2) = watch::channel(false);
+        let handle3 = tokio::spawn(ProcessManager::monitor_process(
+            "test3".to_string(),
+            config_succ2,
+            rx2,
+            watch_rx2,
+        ));
+
+        let (reply_tx2, _) = oneshot::channel();
+        let req_no_id = McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            method: "test".to_string(),
+            params: None,
+        };
+        let _ = tx2.send((req_no_id, reply_tx2)).await;
+
+        // Wait, hit channel drop
+        drop(tx2);
+
+        // write broken pipe
+        let (tx3, rx3) = mpsc::channel(1);
+        let (_, watch_rx3) = watch::channel(false);
+        let handle4 = tokio::spawn(ProcessManager::monitor_process(
+            "test4".to_string(),
+            ProcessConfig {
+                command: Some("sh".to_string()),
+                args: Some(vec!["-c".to_string(), "exit 1".to_string()]),
+                external_address: None,
+                max_retries: 0,
+                restart_delay_ms: 10,
+            },
+            rx3,
+            watch_rx3,
+        ));
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let (reply_tx3, _) = oneshot::channel();
+        let req3 = McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::Value::Number(3.into())),
+            method: "test".to_string(),
+            params: None,
+        };
+        let _ = tx3.send((req3, reply_tx3)).await;
+
+        let _ = handle3.await;
+        let _ = handle4.await;
+
+        // Hit "Channel closed" in handle_request map_err
+        let req_closed = McpRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "arguments": {
+                    "target_language": "closed_target"
+                }
+            })),
+            id: Some(serde_json::json!(1)),
+        };
+
+        // pm handles channels directly, need a dropped one
+        let mut configs_closed = std::collections::HashMap::new();
+        configs_closed.insert(
+            "cdd-closed_target".to_string(),
+            ProcessConfig {
+                command: Some("sh".to_string()),
+                args: Some(vec!["-c".to_string(), "exit 0".to_string()]),
+                external_address: None,
+                max_retries: 0,
+                restart_delay_ms: 0,
+            },
+        );
+        let pm_closed = ProcessManager::new(configs_closed);
+        pm_closed.start_all().await.expect("start");
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await; // let it exit
+        let res_closed = pm_closed.handle_request(req_closed.clone()).await;
+        println!("RES_CLOSED: {:?}", res_closed);
+        assert!(res_closed.is_err());
+
+        // write broken pipe directly to the child's channel
+        let (tx5, rx5) = mpsc::channel(1);
+        let (_, watch_rx5) = watch::channel(false);
+        let handle5 = tokio::spawn(ProcessManager::monitor_process(
+            "test5".to_string(),
+            ProcessConfig {
+                command: Some("sh".to_string()),
+                args: Some(vec!["-c".to_string(), "exit 1".to_string()]),
+                external_address: None,
+                max_retries: 0,
+                restart_delay_ms: 10,
+            },
+            rx5,
+            watch_rx5,
+        ));
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let (reply_tx5, _) = oneshot::channel();
+        let _ = tx5.send((req_closed.clone(), reply_tx5)).await;
+        let _ = handle5.await;
+
+        pm_closed.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn test_coverage_for_mcp_unmatched_id_and_timeout() {
+        let config = ProcessConfig {
+            command: Some("sh".to_string()),
+            args: Some(vec!["-c".to_string(), "sleep 0.1 && exit 0".to_string()]),
+            external_address: None,
+            max_retries: 0,
+            restart_delay_ms: 10,
+        };
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (_watch_tx, watch_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(ProcessManager::monitor_process(
+            "test-cov".to_string(),
+            config,
+            rx,
+            watch_rx,
+        ));
+
+        // Test sending something while the process shuts down to hit branches
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // We expect the handle to return now.
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_daemon_missing_req_id() {
+        let config = ProcessConfig {
+            command: Some("sh".to_string()),
+            args: Some(vec!["-c".to_string(), "cat".to_string()]),
+            external_address: None,
+            max_retries: 0,
+            restart_delay_ms: 10,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(ProcessManager::monitor_process(
+            "test-missing-id".to_string(),
+            config,
+            rx,
+            watch_rx,
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send a request without an ID
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            method: "test".into(),
+            params: None,
+            id: None,
+        };
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        let _ = tx.send((req, reply_tx)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = watch_tx.send(true);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_hit_none_branch_stdin() {
+        let config = ProcessConfig {
+            command: Some("sh".to_string()),
+            args: Some(vec!["-c".to_string(), "sleep 5".to_string()]),
+            external_address: None,
+            max_retries: 0,
+            restart_delay_ms: 10,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (watch_tx, watch_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(ProcessManager::monitor_process(
+            "test-stdin".to_string(),
+            config,
+            rx,
+            watch_rx,
+        ));
+
+        // drop the sender to send None
+        drop(tx);
+
+        // give it a moment to process the drop, then signal shutdown to prevent hanging
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = watch_tx.send(true);
+
+        let _ = handle.await;
+    }
+    #[tokio::test]
+    async fn test_daemon_coverage_outer_break() {
+        use crate::daemon::{ProcessConfig, ProcessManager};
+        use tokio::sync::{mpsc, watch};
+        let config = ProcessConfig {
+            command: Some("sh".to_string()),
+            args: Some(vec!["-c".to_string(), "sleep 10".to_string()]),
+            external_address: None,
+            max_retries: 5,
             restart_delay_ms: 0,
-        },
-    );
-    let pm = ProcessManager::new(configs);
-    let _ = pm.start_all().await;
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    let req = McpRequest {
-        jsonrpc: "2.0".into(),
-        method: "tools/call".into(),
-        params: Some(serde_json::json!({
-            "arguments": {
-                "target_language": "responder"
-            }
-        })),
-        id: Some(serde_json::json!(99)),
-    };
-    let res = pm.handle_request(req).await;
-    assert!(res.is_ok());
-    pm.stop_all().await;
-}
+        };
+        let (_, rx) = mpsc::channel(1);
+        let (watch_tx, watch_rx) = watch::channel(false);
+        let handle = tokio::spawn(ProcessManager::monitor_process(
+            "test_outer_break".to_string(),
+            config,
+            rx,
+            watch_rx,
+        ));
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let _ = watch_tx.send(true);
+        let _ = handle.await;
+    }
+    #[tokio::test]
+    async fn test_daemon_mcp_response_coverage() {
+        use crate::daemon::{ProcessConfig, ProcessManager};
+        use crate::mcp::McpRequest;
+        let mut configs = std::collections::HashMap::new();
+        configs.insert(
+            "cdd-responder".to_string(),
+            ProcessConfig {
+                command: Some("sh".to_string()),
+                args: Some(vec![
+                    "-c".to_string(),
+                    "read line; echo '{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}'".to_string(),
+                ]),
+                external_address: None,
+                max_retries: 0,
+                restart_delay_ms: 0,
+            },
+        );
+        let pm = ProcessManager::new(configs);
+        let _ = pm.start_all().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "arguments": {
+                    "target_language": "responder"
+                }
+            })),
+            id: Some(serde_json::json!(99)),
+        };
+        let res = pm.handle_request(req).await;
+        assert!(res.is_ok());
+        pm.stop_all().await;
+    }
 
-#[tokio::test]
-async fn test_daemon_shutdown_flow() {
-    let config = ProcessConfig {
-        command: Some("sh".to_string()),
-        args: Some(vec!["-c".to_string(), "sleep 10".to_string()]),
-        external_address: None,
-        max_retries: 0,
-        restart_delay_ms: 10,
-    };
-    let (_tx, rx) = mpsc::channel(1);
-    let (watch_tx, watch_rx) = watch::channel(false);
+    #[tokio::test]
+    async fn test_daemon_shutdown_flow() {
+        let config = ProcessConfig {
+            command: Some("sh".to_string()),
+            args: Some(vec!["-c".to_string(), "sleep 10".to_string()]),
+            external_address: None,
+            max_retries: 0,
+            restart_delay_ms: 10,
+        };
+        let (_tx, rx) = mpsc::channel(1);
+        let (watch_tx, watch_rx) = watch::channel(false);
 
-    let handle = tokio::spawn(ProcessManager::monitor_process(
-        "test-shutdown".to_string(),
-        config,
-        rx,
-        watch_rx,
-    ));
+        let handle = tokio::spawn(ProcessManager::monitor_process(
+            "test-shutdown".to_string(),
+            config,
+            rx,
+            watch_rx,
+        ));
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let _ = watch_tx.send(true);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
-        .await
-        .expect("shutdown test timeout");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = watch_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("shutdown test timeout");
+    }
 }
