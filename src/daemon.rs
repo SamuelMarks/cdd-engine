@@ -408,6 +408,7 @@ mod tests {
             id: Some(serde_json::json!(2)),
         };
         let res = pm.handle_request(req).await;
+        println!("ERROR: {:?}", res.as_ref().err().unwrap());
         assert!(res.is_err());
     }
 
@@ -425,6 +426,7 @@ mod tests {
             id: Some(serde_json::json!(3)),
         };
         let res = pm.handle_request(req).await;
+        println!("ERROR: {:?}", res.as_ref().err().unwrap());
         assert!(res.is_err());
     }
 
@@ -536,6 +538,7 @@ mod more_tests {
             id: Some(serde_json::json!(101)),
         };
         let res = pm.handle_request(req).await;
+        println!("ERROR: {:?}", res.as_ref().err().unwrap());
         assert!(res.is_err());
         pm.stop_all().await;
     }
@@ -921,5 +924,43 @@ mod more_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
             .await
             .expect("shutdown test timeout");
+    }
+}
+
+#[cfg(test)]
+mod rx_test {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_daemon_dropped_response_rx_err() {
+        let config = ProcessConfig {
+            command: Some("sh".to_string()),
+            args: Some(vec!["-c".to_string(), "read line; exit 0".to_string()]),
+            external_address: None,
+            max_retries: 0,
+            restart_delay_ms: 0,
+        };
+        let mut configs = HashMap::new();
+        configs.insert("cdd-drop-rx-test".to_string(), config);
+        let pm = ProcessManager::new(configs);
+        let _ = pm.start_all().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            method: "tools/call".into(),
+            params: Some(serde_json::json!({
+                "arguments": {
+                    "target_language": "drop-rx-test"
+                }
+            })),
+            id: Some(serde_json::json!(102)),
+        };
+        let res = pm.handle_request(req).await;
+        println!("ERROR: {:?}", res.as_ref().err().unwrap());
+        assert!(res.is_err());
+        pm.stop_all().await;
     }
 }
