@@ -32,7 +32,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests & coverage
-        run: cargo tarpaulin --verbose --workspace --timeout 120 --out xml
+        run: cargo tarpaulin --engine llvm --verbose --workspace --timeout 120 --out xml
 
       - name: Build docs
         run: cargo doc --no-deps
