@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build Release
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Prepare Release Archive
+        run: |
+          mkdir -p release_assets
+          # cdd-engine is a library, so we package the rlib
+          tar -czvf release_assets/cdd-engine-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release libcdd_engine.rlib || true
+          # If it produces a binary in the future, package that as well
+          [ -f target/x86_64-unknown-linux-gnu/release/cdd-engine ] && tar -rvf release_assets/cdd-engine-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release cdd-engine || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release_assets/cdd-engine-linux-x86_64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
