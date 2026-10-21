@@ -1,38 +1,32 @@
 #![deny(missing_docs)]
 #![deny(clippy::missing_docs_in_private_items)]
-#![allow(
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::similar_names,
-    clippy::significant_drop_tightening,
-    clippy::too_many_lines,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::uninlined_format_args,
-    clippy::float_cmp,
-    clippy::option_if_let_else,
-    clippy::module_name_repetitions,
-    clippy::unused_self,
-    clippy::used_underscore_binding
-)]
+#![deny(clippy::missing_errors_doc)]
+#![deny(clippy::missing_panics_doc)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 
-//! cdd-engine core library
+//! `cdd-engine` core execution library.
+//!
+//! This crate provides the asynchronous daemon manager for external JSON-RPC / Model Context
+//! Protocol (MCP) language servers (`cdd-*`), strongly typed MCP protocol structures, a
+//! `GraalVM` WebAssembly host linker, and an embedded `wasmtime` / `rquickjs` sandboxed
+//! execution engine.
 
-/// Configuration module
+/// Configuration loading and validation for the engine and managed processes.
 pub mod config;
-/// Daemon module
+/// Asynchronous daemon lifecycle supervisor and stdio JSON-RPC / MCP bridge.
 pub mod daemon;
-/// Error module
+/// Unified error definitions and JSON-RPC error code mappings for `cdd-engine`.
 pub mod error;
-/// GraalVM WASM Linker mock state
+/// `GraalVM` WebAssembly host import bindings and virtual heap state.
 pub mod graalvm_linker;
-/// WASM execution orchestration
+/// Model Context Protocol (MCP) JSON-RPC 2.0 domain types and orchestrator trait.
+pub mod mcp;
+/// WebAssembly (WASI and `QuickJS`) execution orchestration and file extraction.
 pub mod wasm_executor;
 
 pub use config::AppConfig;
 pub use daemon::{ProcessConfig, ProcessManager};
 pub use error::CddEngineError;
-/// MCP module
-pub mod mcp;
+pub use mcp::{McpOrchestrator, McpRequest, McpResponse, RequestId, TargetLanguage};
+pub use wasm_executor::{GeneratedFile, NativeWasmExecutor, WasmExecutor};

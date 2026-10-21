@@ -1,25 +1,14 @@
-# Stage 1: Build
+# Stage 1: Build & Verify cdd-engine
 FROM rust:alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache musl-dev gcc pkgconfig openssl-dev postgresql-dev
+RUN apk add --no-cache musl-dev gcc pkgconfig
 
-# Create a new empty shell project
-WORKDIR /usr/src/cdd-ctl
+WORKDIR /usr/src/cdd-engine
 COPY . .
 
-# Build for release
-RUN cargo build --release
+RUN cargo build --release && cargo test --release
 
-# Stage 2: Final
 FROM alpine:latest
-
-# Install runtime dependencies if needed
-RUN apk add --no-cache libgcc openssl curl libpq
-
-WORKDIR /usr/local/bin
-COPY --from=builder /usr/src/cdd-ctl/target/release/cdd-ctl .
-
-EXPOSE 8080
-
-ENTRYPOINT ["cdd-ctl", "--bind", "0.0.0.0:8080"]
+WORKDIR /usr/src/cdd-engine
+COPY --from=builder /usr/src/cdd-engine/Cargo.toml .
+CMD ["echo", "cdd-engine verified"]

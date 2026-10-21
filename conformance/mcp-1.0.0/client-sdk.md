@@ -1,6 +1,6 @@
-# Model Context Protocol (MCP) Server Generator Conformance Table
+# Model Context Protocol (MCP) SDK Conformance Table
 
-This table tracks the completeness of language Server generator integration with the Model Context Protocol (MCP). It is divided into three sections:
+This table tracks the completeness of language SDK integration with the Model Context Protocol (MCP). It is divided into three sections:
 1. **Architectural Integration Layers**: Tracks the exposure of MCP across the CLI, SDK, and Server boundaries.
 2. **Semantic & Conceptual Features**: Tracks protocol mechanics, transports, and behavioral requirements.
 3. **Schema & Object Conformance**: An exhaustive property-by-property map derived directly from the official MCP JSON Schema (2024-11-05).

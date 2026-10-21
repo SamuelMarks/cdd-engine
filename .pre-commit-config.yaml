@@ -9,28 +9,32 @@ repos:
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        description: Format files with rustfmt.
-        entry: bash -c 'cargo fmt --all -- --check || (cargo fmt --all && exit 1)'
+        description: Format files with cargo fmt.
+        entry: bash -c 'cargo +stable fmt --all -- --check || cargo fmt --all -- --check'
         language: system
         types: [rust]
         pass_filenames: false
-
       - id: cargo-check
         name: cargo check
         description: Check the package for errors.
-        entry: cargo check --workspace
+        entry: bash -c 'cargo +stable check --all || cargo check --all'
         language: system
         types: [rust]
         pass_filenames: false
-
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint the package with clippy.
+        entry: bash -c 'cargo +stable clippy --all-targets --all-features -- -D warnings || cargo clippy --all-targets --all-features -- -D warnings'
+        language: system
+        types: [rust]
+        pass_filenames: false
       - id: cargo-test
         name: cargo test
-        description: Run tests.
-        entry: cargo test --workspace
+        description: Run tests for the package.
+        entry: bash -c 'cargo +stable test --all || cargo test --all'
         language: system
         types: [rust]
         pass_filenames: false
-
       - id: coverage-shields
         name: Update Coverage Shields
         description: Run tarpaulin and update README.md shields

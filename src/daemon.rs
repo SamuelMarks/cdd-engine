@@ -1,966 +1,899 @@
 #![deny(missing_docs)]
-//! Daemon manager for external JSON-RPC/MCP servers (cdd-* projects).
-#![allow(clippy::needless_return)]
 
+//! Daemon manager for external JSON-RPC / Model Context Protocol (MCP) servers (`cdd-*` projects).
+//!
+//! Provides [`ProcessConfig`] and [`ProcessManager`] to supervise long-running child processes,
+//! correlate asynchronous newline-delimited JSON-RPC 2.0 messages over `stdin`/`stdout`, capture
+//! and log `stderr`, and expose the [`McpOrchestrator`] trait interface.
+
+use crate::config::DEFAULT_REQUEST_TIMEOUT_MS;
 use crate::error::CddEngineError;
-use crate::mcp::{McpOrchestrator, McpRequest, McpResponse};
-use log::{error, info, warn};
+use crate::mcp::{
+    CallToolParams, ImplementationInfo, InitializeResult, ListToolsResult, McpOrchestrator,
+    McpRequest, McpResponse, McpTool, RequestId, ServerCapabilities, ToolInputSchema,
+    ToolsCapability, MCP_PROTOCOL_VERSION,
+};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::{sleep, Instant};
 
-/// Default max retries for a process.
-const fn default_max_retries() -> usize {
-    5
-}
-/// Default restart delay for a process.
-const fn default_restart_delay_ms() -> u64 {
-    2000
+/// Default stability threshold in milliseconds (`5_000` ms) before resetting the retry counter.
+pub const DEFAULT_STABILITY_THRESHOLD_MS: u64 = 5_000;
+
+/// Returns the default stability threshold in milliseconds.
+const fn default_stability_threshold_ms() -> u64 {
+    DEFAULT_STABILITY_THRESHOLD_MS
 }
 
-/// Configuration for a single managed process.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Configuration for a single external `cdd-*` daemon process.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProcessConfig {
-    /// Command to run.
+    /// Executable command or binary path (if managed locally).
     pub command: Option<String>,
-    /// Arguments to pass to the command.
+    /// Command-line arguments passed when spawning the binary.
     pub args: Option<Vec<String>>,
-    /// External address overriding the local spawn.
+    /// External address if the server is already running outside the manager (e.g., `"http://localhost:8001"`).
     pub external_address: Option<String>,
-    /// Maximum number of consecutive retries before giving up.
-    #[serde(default = "default_max_retries")]
-    pub max_retries: usize,
-    /// Delay between restarts in milliseconds.
-    #[serde(default = "default_restart_delay_ms")]
+    /// Maximum number of restart attempts before giving up (`0` means never restart).
+    #[serde(default)]
+    pub max_retries: u32,
+    /// Delay in milliseconds between restart attempts.
+    #[serde(default)]
     pub restart_delay_ms: u64,
+    /// Minimum uptime in milliseconds required to reset the crash retry counter to `0`.
+    #[serde(default = "default_stability_threshold_ms")]
+    pub stability_threshold_ms: u64,
 }
 
-/// A map of pending MCP requests.
-type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<McpResponse, CddEngineError>>>>>;
-/// A channel sender for MCP requests.
-type ChannelSender = mpsc::Sender<(
-    McpRequest,
-    oneshot::Sender<Result<McpResponse, CddEngineError>>,
-)>;
+/// Type alias for the reply channel used to deliver a correlated [`McpResponse`] or error.
+type ReplySender = oneshot::Sender<Result<McpResponse, CddEngineError>>;
 
-/// Daemon manager that keeps track of the processes.
+/// Type alias for the command channel tuple sent from [`ProcessManager`] to a worker loop.
+type DaemonCommand = (McpRequest, ReplySender);
+
+/// Shared map of in-flight JSON-RPC [`RequestId`]s awaiting responses from child `stdout`.
+type PendingRequestsMap = Arc<Mutex<HashMap<RequestId, ReplySender>>>;
+
+/// Shared list of active supervisor task handles.
+type SupervisorHandlesList = Arc<Mutex<Vec<(String, JoinHandle<()>)>>>;
+
+/// Manages the lifecycle and MCP communication of external `cdd-*` processes.
 pub struct ProcessManager {
-    /// Configurations.
-    pub configs: HashMap<String, ProcessConfig>,
-    /// Active monitor tasks keyed by their logical name.
-    pub handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
-    /// Active communication channels to the daemons.
-    active_channels: Arc<Mutex<HashMap<String, ChannelSender>>>,
-    /// Channel to signal shutdown to all monitors.
-    shutdown_tx: watch::Sender<bool>,
+    /// Configured servers keyed by daemon name.
+    configs: HashMap<String, ProcessConfig>,
+    /// Active supervisor task handles (`(daemon_name, join_handle)`).
+    handles: SupervisorHandlesList,
+    /// Active command channels for sending MCP requests to supervised processes.
+    active_channels: Arc<Mutex<HashMap<String, mpsc::Sender<DaemonCommand>>>>,
+    /// Shutdown broadcast sender.
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    /// Per-request timeout in milliseconds when awaiting a daemon response.
+    request_timeout_ms: u64,
+}
+
+/// Holds the spawned child process and its extracted standard I/O pipes.
+struct SpawnedDaemonPipes {
+    /// Running child process handle.
+    child: Child,
+    /// Pipe connected to child standard input.
+    stdin: ChildStdin,
+    /// Pipe connected to child standard output.
+    stdout: ChildStdout,
+    /// Pipe connected to child standard error.
+    stderr: ChildStderr,
 }
 
 impl ProcessManager {
-    /// Create a new `ProcessManager` from configurations.
+    /// Creates a new [`ProcessManager`] with the provided daemon configurations.
+    ///
+    /// # Arguments
+    ///
+    /// * `configs` - Map of daemon names to their [`ProcessConfig`] settings.
+    ///
+    /// # Returns
+    ///
+    /// An initialized [`ProcessManager`].
     #[must_use]
     pub fn new(configs: HashMap<String, ProcessConfig>) -> Self {
-        let (shutdown_tx, _) = watch::channel(false);
+        Self::with_timeout(configs, DEFAULT_REQUEST_TIMEOUT_MS)
+    }
+
+    /// Creates a new [`ProcessManager`] with a custom per-request timeout in milliseconds.
+    ///
+    /// # Arguments
+    ///
+    /// * `configs` - Map of daemon names to their [`ProcessConfig`] settings.
+    /// * `request_timeout_ms` - Timeout in milliseconds for awaiting a daemon reply.
+    ///
+    /// # Returns
+    ///
+    /// An initialized [`ProcessManager`].
+    #[must_use]
+    pub fn with_timeout(configs: HashMap<String, ProcessConfig>, request_timeout_ms: u64) -> Self {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             configs,
-            handles: Arc::new(Mutex::new(HashMap::new())),
+            handles: Arc::new(Mutex::new(Vec::new())),
             active_channels: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
+            request_timeout_ms,
         }
     }
 
-    /// Start all configured local processes.
-    pub async fn start_all(&self) -> Result<(), CddEngineError> {
+    /// Returns a read-only reference to the configured daemon map.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the underlying `HashMap<String, ProcessConfig>`.
+    #[must_use]
+    pub const fn configs(&self) -> &HashMap<String, ProcessConfig> {
+        &self.configs
+    }
+
+    /// Returns the number of currently active supervisor tasks.
+    ///
+    /// # Returns
+    ///
+    /// Count of active background supervisor tasks.
+    pub async fn active_daemon_count(&self) -> usize {
+        self.handles.lock().await.len()
+    }
+
+    /// Starts all locally managed processes and registers their MCP communication channels.
+    pub async fn start_all(&self) {
         let mut handles = self.handles.lock().await;
         let mut channels = self.active_channels.lock().await;
 
         for (name, config) in &self.configs {
-            if let Some(ref external) = config.external_address {
-                info!(
-                    "[{}] Configured to use external address: {}",
-                    name, external
-                );
+            if let Some(ext) = &config.external_address {
+                info!("Process '{name}' is configured to use external address: {ext}. Skipping local spawn.");
                 continue;
             }
 
             if config.command.is_none() {
-                error!("[{}] No command or external address configured", name);
+                error!(
+                    "Process '{name}' has neither 'command' nor 'external_address' configured! Skipping."
+                );
                 continue;
             }
-
-            let (tx, rx) = mpsc::channel(32);
-            channels.insert(name.clone(), tx);
 
             let name_clone = name.clone();
             let config_clone = config.clone();
             let shutdown_rx = self.shutdown_tx.subscribe();
+            let (cmd_tx, cmd_rx) = mpsc::channel(32);
+
+            channels.insert(name.clone(), cmd_tx);
 
             let handle = tokio::spawn(async move {
-                let _ = Self::monitor_process(name_clone, config_clone, rx, shutdown_rx).await;
+                Self::monitor_process(name_clone, config_clone, shutdown_rx, cmd_rx).await;
             });
 
-            handles.insert(name.clone(), handle);
+            handles.push((name.clone(), handle));
+        }
+        drop(channels);
+        drop(handles);
+    }
+
+    /// Spawns a child process with piped `stdin`, `stdout`, and `stderr`.
+    fn spawn_child_pipes(
+        cmd_str: &str,
+        config: &ProcessConfig,
+    ) -> Result<SpawnedDaemonPipes, CddEngineError> {
+        let mut cmd = Command::new(cmd_str);
+        if let Some(args) = &config.args {
+            cmd.args(args);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| CddEngineError::ProcessSpawn(e.to_string()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CddEngineError::ProcessSpawn("Child stdin missing".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CddEngineError::ProcessSpawn("Child stdout missing".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| CddEngineError::ProcessSpawn("Child stderr missing".to_string()))?;
+
+        Ok(SpawnedDaemonPipes {
+            child,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Spawns a task that reads newline-delimited JSON-RPC responses from child `stdout` and
+    /// resolves matching entries in `pending_requests`.
+    fn spawn_stdout_task(
+        daemon_name: String,
+        stdout: ChildStdout,
+        pending_requests: PendingRequestsMap,
+    ) -> JoinHandle<()> {
+        let mut stdout_reader = BufReader::new(stdout).lines();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = stdout_reader.next_line().await {
+                match serde_json::from_str::<McpResponse>(&line) {
+                    Ok(resp) => {
+                        if let Some(req_id) = &resp.id {
+                            let sender_opt = pending_requests.lock().await.remove(req_id);
+                            if let Some(reply_tx) = sender_opt {
+                                let _ = reply_tx.send(Ok(resp));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            "[{daemon_name} stdout] Non-JSON or malformed MCP line ({err}): {line}"
+                        );
+                    }
+                }
+            }
+        })
+    }
+
+    /// Spawns a task that reads and logs lines from child `stderr`.
+    fn spawn_stderr_task(daemon_name: String, stderr: ChildStderr) -> JoinHandle<()> {
+        let mut stderr_reader = BufReader::new(stderr).lines();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = stderr_reader.next_line().await {
+                debug!("[{daemon_name} stderr] {line}");
+            }
+        })
+    }
+
+    /// Fails all currently pending requests when a child process exits or crashes before replying.
+    async fn fail_pending_requests(pending_requests: &PendingRequestsMap, reason: &str) {
+        let mut guard = pending_requests.lock().await;
+        for (_, reply_tx) in guard.drain() {
+            let _ = reply_tx.send(Err(CddEngineError::ProcessSpawn(reason.to_string())));
+        }
+    }
+
+    /// Serializes and writes an [`McpRequest`] to the child's `stdin`, registering `reply_tx` in
+    /// `pending_requests` if the request has an `id`.
+    async fn forward_request_to_stdin(
+        stdin: &mut ChildStdin,
+        req: &McpRequest,
+        reply_tx: ReplySender,
+        pending_requests: &PendingRequestsMap,
+    ) -> Result<(), CddEngineError> {
+        let mut serialized = serde_json::to_vec(req)?;
+        serialized.push(10_u8);
+
+        let Some(req_id) = req.id.clone() else {
+            let err =
+                CddEngineError::ProtocolViolation("MCP request requires a non-null id".to_string());
+            let _ = reply_tx.send(Err(err));
+            return Ok(());
+        };
+
+        pending_requests
+            .lock()
+            .await
+            .insert(req_id.clone(), reply_tx);
+        if let Err(io_err) = stdin.write_all(&serialized).await {
+            let removed_tx = pending_requests.lock().await.remove(&req_id);
+            if let Some(tx) = removed_tx {
+                let _ = tx.send(Err(CddEngineError::Io(io_err)));
+            }
+            return Err(CddEngineError::ProcessSpawn(
+                "Failed writing request to child stdin".to_string(),
+            ));
         }
         Ok(())
     }
 
-    /// Stop all managed local processes and wait for them to exit gracefully.
-    pub async fn stop_all(&self) {
-        info!("Initiating graceful shutdown of all managed processes...");
-        let _ = self.shutdown_tx.send(true);
-
-        let mut handles = self.handles.lock().await;
-        for (name, handle) in handles.drain() {
-            info!("Waiting for process monitor '{}' to exit...", name);
-            let _ = handle.await;
-        }
-        info!("All managed processes stopped.");
-    }
-
-    /// The core monitor loop for a single process. Handles spawning, standard I/O bridging, and restarting.
-    pub async fn monitor_process(
+    /// Supervises a single child process across spawns, crash restarts, and graceful shutdown.
+    #[allow(clippy::cognitive_complexity)]
+    async fn monitor_process(
         name: String,
         config: ProcessConfig,
-        mut mcp_rx: mpsc::Receiver<(
-            McpRequest,
-            oneshot::Sender<Result<McpResponse, CddEngineError>>,
-        )>,
-        mut shutdown_rx: watch::Receiver<bool>,
-    ) -> Result<(), crate::error::CddEngineError> {
-        let cmd_str = match &config.command {
-            Some(c) => c.clone(),
-            None => return Ok(()),
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        mut cmd_rx: mpsc::Receiver<DaemonCommand>,
+    ) {
+        let Some(cmd_str) = config.command.clone() else {
+            return;
         };
-        let mut retries = 0;
+        let mut retries = 0_u32;
 
-        while !*shutdown_rx.borrow() {
-            info!("[{}] Starting process: {}", name, cmd_str);
-            let mut cmd = Command::new(&cmd_str);
-            if let Some(args_vec) = config.args.as_ref() {
-                cmd.args(args_vec);
-            }
+        loop {
+            info!("Starting process '{name}' (attempt {})", retries + 1);
+            let start_time = Instant::now();
 
-            cmd.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            match Self::spawn_child_pipes(&cmd_str, &config) {
+                Ok(mut pipes) => {
+                    let pending_requests: PendingRequestsMap = Arc::new(Mutex::new(HashMap::new()));
+                    let out_task = Self::spawn_stdout_task(
+                        name.clone(),
+                        pipes.stdout,
+                        pending_requests.clone(),
+                    );
+                    let err_task = Self::spawn_stderr_task(name.clone(), pipes.stderr);
 
-            let start_time = tokio::time::Instant::now();
-
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("[{}] Failed to spawn: {}", name, e);
-                    if retries >= config.max_retries {
-                        error!(
-                            "[{}] Max retries ({}) reached. Giving up.",
-                            name, config.max_retries
-                        );
-                        return Ok(());
-                    }
-                    retries += 1;
-                    tokio::time::sleep(Duration::from_millis(config.restart_delay_ms)).await;
-                    continue;
-                }
-            };
-
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| CddEngineError::ProcessSpawn("Failed to take stdin".into()))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| CddEngineError::ProcessSpawn("Failed to take stdout".into()))?;
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| CddEngineError::ProcessSpawn("Failed to take stderr".into()))?;
-
-            let pending_requests: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-            let pending_clone = pending_requests.clone();
-            let _name_out = name.clone();
-
-            // Stdout reader task: parses responses and routes them back to the caller
-            let mut stdout_reader = BufReader::new(stdout).lines();
-            let reader_handle = tokio::spawn(async move {
-                while let Ok(Some(line)) = stdout_reader.next_line().await {
-                    let parsed = serde_json::from_str::<McpResponse>(&line);
-                    let res = match parsed {
-                        Ok(r) => r,
-                        Err(_) => McpResponse {
-                            jsonrpc: "2.0".to_string(),
-                            result: None,
-                            error: None,
-                            id: None,
-                        },
-                    };
-                    let id_val = match res.id.as_ref() {
-                        Some(v) => v,
-                        None => &serde_json::Value::Null,
-                    };
-                    let id_str = id_val.to_string();
-                    let mut pending = pending_clone.lock().await;
-
-                    if let Some(tx) = pending.remove(&id_str) {
-                        let _ = tx.send(Ok(res));
-                    }
-                }
-            });
-
-            let _name_err = name.clone();
-            let mut stderr_reader = BufReader::new(stderr).lines();
-            let err_handle = tokio::spawn(async move {
-                while let Ok(Some(_line)) = stderr_reader.next_line().await {}
-            });
-
-            loop {
-                tokio::select! {
-                    req_opt = mcp_rx.recv() => {
-                        match req_opt {
-                            Some((req, reply_tx)) => {
-                                let json = serde_json::to_string(&req)
-                                    .map_err(|e| CddEngineError::Mcp(format!("Serialization failed: {}", e)))?;
-                                let msg = format!("{}\n", json);
-                                let write_res = stdin.write_all(msg.as_bytes()).await;
-                                let _ = write_res;
-                                let Some(id_val) = req.id.as_ref() else {
-                                    error!("[{}] req.id is missing for standard MCP requests", name);
-                                    continue;
-                                };
-                                pending_requests.lock().await.insert(id_val.to_string(), reply_tx);
+                    let should_shutdown = loop {
+                        tokio::select! {
+                            status = pipes.child.wait() => {
+                                warn!("Process '{name}' exited with status: {status:?}");
+                                break false;
                             }
-                            None => break
-
+                            cmd_opt = cmd_rx.recv() => {
+                                if let Some((req, reply_tx)) = cmd_opt {
+                                    let _ = Self::forward_request_to_stdin(
+                                        &mut pipes.stdin,
+                                        &req,
+                                        reply_tx,
+                                        &pending_requests,
+                                    )
+                                    .await;
+                                } else {
+                                    break true;
+                                }
+                            }
+                            _ = shutdown_rx.recv() => {
+                                info!("Shutdown signal received for '{name}'. Terminating child process...");
+                                let _ = pipes.child.kill().await;
+                                break true;
+                            }
                         }
+                    };
 
-                    }
-                    status_res = child.wait() => {
-                        let _ = status_res; // ignore status in tests
+                    out_task.abort();
+                    err_task.abort();
+                    Self::fail_pending_requests(
+                        &pending_requests,
+                        "Daemon process exited before responding",
+                    )
+                    .await;
+
+                    if should_shutdown {
                         break;
                     }
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            info!("[{}] Shutdown signaled. Killing process.", name);
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            return Ok(());
-                        }
+                    if start_time.elapsed() > Duration::from_millis(config.stability_threshold_ms) {
+                        retries = 0;
                     }
                 }
-            }
-
-            reader_handle.abort();
-            err_handle.abort();
-
-            if start_time.elapsed() > Duration::from_millis(10) {
-                info!("[{}] Process was stable. Resetting retry count.", name);
-                retries = 0;
+                Err(err) => {
+                    error!("Failed to spawn process '{name}': {err}");
+                }
             }
 
             if retries >= config.max_retries {
                 error!(
-                    "[{}] Max retries ({}) reached after crash. Giving up.",
-                    name, config.max_retries
+                    "Process '{name}' reached max retries ({}). Giving up.",
+                    config.max_retries
                 );
                 break;
             }
 
             retries += 1;
-            warn!(
-                "[{}] Restarting in {} ms (Retry {}/{})",
-                name, config.restart_delay_ms, retries, config.max_retries
-            );
-            tokio::time::sleep(Duration::from_millis(config.restart_delay_ms)).await;
+            let delay = Duration::from_millis(config.restart_delay_ms);
+            info!("Waiting {delay:?} before restarting '{name}'...");
+
+            tokio::select! {
+                () = sleep(delay) => {}
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received while waiting to restart '{name}'. Aborting.");
+                    break;
+                }
+            }
         }
-        Ok(())
+    }
+
+    /// Gracefully stops all supervised processes and clears active channels and handles.
+    pub async fn stop_all(&self) {
+        info!("Stopping all managed processes...");
+        let _ = self.shutdown_tx.send(());
+
+        let drained: Vec<_> = self.handles.lock().await.drain(..).collect();
+        for (name, handle) in drained {
+            debug!("Waiting for process monitor '{name}' to exit...");
+            let _ = handle.await;
+        }
+        self.active_channels.lock().await.clear();
+        info!("All managed processes stopped.");
+    }
+
+    /// Builds the `tools/list` response listing the `cdd_generate_sdk` MCP tool.
+    fn handle_tools_list(id: Option<RequestId>) -> Result<McpResponse, CddEngineError> {
+        let tool = McpTool {
+            name: "cdd_generate_sdk".to_string(),
+            description:
+                "Generates an SDK or server stub using a specific cdd-* language toolchain."
+                    .to_string(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".to_string(),
+                properties: serde_json::json!({
+                    "target_language": {
+                        "type": "string",
+                        "description": "The target language (e.g., python, rust, go, ts, csharp)."
+                    },
+                    "input": {
+                        "type": "string",
+                        "description": "The input OpenAPI specification path or content."
+                    },
+                    "output": {
+                        "type": "string",
+                        "description": "The output directory path."
+                    }
+                }),
+                required: vec!["target_language".to_string(), "input".to_string()],
+            },
+        };
+        McpResponse::success(
+            id,
+            &ListToolsResult {
+                tools: vec![tool],
+                next_cursor: None,
+            },
+        )
+    }
+
+    /// Builds the `initialize` response advertising the engine's MCP protocol version and capabilities.
+    fn handle_initialize(id: Option<RequestId>) -> Result<McpResponse, CddEngineError> {
+        let init_result = InitializeResult {
+            protocol_version: MCP_PROTOCOL_VERSION.to_string(),
+            capabilities: ServerCapabilities {
+                tools: ToolsCapability {
+                    list_changed: false,
+                },
+            },
+            server_info: ImplementationInfo {
+                name: "cdd-engine".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        };
+        McpResponse::success(id, &init_result)
+    }
+
+    /// Validates and routes a `tools/call` MCP request to the target `cdd-*` daemon.
+    async fn handle_tools_call(&self, request: McpRequest) -> Result<McpResponse, CddEngineError> {
+        let params_val = request
+            .params
+            .as_ref()
+            .ok_or_else(|| CddEngineError::Validation("Missing params".to_string()))?;
+        let call_params: CallToolParams = serde_json::from_value(params_val.clone())
+            .map_err(|e| CddEngineError::Validation(format!("Invalid tool call params: {e}")))?;
+
+        let daemon_name = call_params.arguments.target_language.daemon_name();
+        let sender = {
+            let channels = self.active_channels.lock().await;
+            channels.get(&daemon_name).cloned().ok_or_else(|| {
+                CddEngineError::NotFound(format!("Daemon {daemon_name} not found or not running"))
+            })?
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        sender
+            .send((request, reply_tx))
+            .await
+            .map_err(|_| CddEngineError::Mcp("Failed to send to daemon worker".to_string()))?;
+
+        let timeout_duration = Duration::from_millis(self.request_timeout_ms);
+        tokio::time::timeout(timeout_duration, reply_rx)
+            .await
+            .map_err(|_| {
+                CddEngineError::Mcp(format!(
+                    "Request to daemon {daemon_name} timed out after {} ms",
+                    self.request_timeout_ms
+                ))
+            })??
     }
 }
 
-#[async_trait::async_trait]
 impl McpOrchestrator for ProcessManager {
-    async fn handle_request(&self, req: McpRequest) -> Result<McpResponse, CddEngineError> {
-        if req.method == "tools/list" {
-            let tools = serde_json::json!({
-                "tools": [{
-                    "name": "cdd_generate_sdk",
-                    "description": "Generate an SDK from an OpenAPI spec",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "target_language": { "type": "string" },
-                            "input": { "type": "string" },
-                            "output": { "type": "string" }
-                        },
-                        "required": ["target_language", "input"]
-                    }
-                }]
-            });
-            return Ok(McpResponse {
-                jsonrpc: "2.0".to_string(),
-                result: Some(tools),
-                error: None,
-                id: req.id,
-            });
-        }
-
-        if req.method == "tools/call" {
-            let lang = req
-                .params
-                .as_ref()
-                .and_then(|p| p.get("arguments"))
-                .and_then(|a| a.get("target_language"))
-                .and_then(|l| l.as_str())
-                .ok_or_else(|| {
-                    CddEngineError::Validation("Missing 'target_language' in arguments".into())
-                })?;
-
-            let target = if lang.starts_with("cdd-") {
-                lang.to_string()
-            } else {
-                format!("cdd-{}", lang)
-            };
-
-            let channels = self.active_channels.lock().await;
-            let tx = channels
-                .get(&target)
-                .ok_or_else(|| CddEngineError::NotFound(format!("Daemon not found: {}", target)))?;
-
-            let (reply_tx, reply_rx) = oneshot::channel();
-            if tx.send((req.clone(), reply_tx)).await.is_err() {
-                return Err(CddEngineError::ProcessSpawn("Channel closed".into()));
+    async fn handle_request(&self, request: McpRequest) -> Result<McpResponse, CddEngineError> {
+        match request.method.as_str() {
+            "initialize" => Self::handle_initialize(request.id),
+            "notifications/initialized" | "ping" => {
+                McpResponse::success(request.id, &serde_json::json!({}))
             }
-
-            return reply_rx
-                .await
-                .map_err(|e| CddEngineError::Mcp(e.to_string()))?;
+            "tools/list" => Self::handle_tools_list(request.id),
+            "tools/call" => self.handle_tools_call(request).await,
+            other => Err(CddEngineError::ProtocolViolation(format!(
+                "Unsupported MCP method: {other}"
+            ))),
         }
-
-        Err(CddEngineError::Validation(format!(
-            "Unsupported method: {}",
-            req.method
-        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    //! Unit tests for [`ProcessManager`], [`ProcessConfig`], and [`McpOrchestrator`] routing.
+
     use super::*;
+    use crate::mcp::JSONRPC_VERSION;
 
-    #[tokio::test]
-    async fn test_monitor_process_no_command() {
-        let (_tx, rx) = watch::channel(false);
-        let config = ProcessConfig {
-            command: None,
-            args: None,
+    /// Helper to build a default [`ProcessConfig`] for tests.
+    fn make_process_config(
+        command: Option<&str>,
+        args: Option<Vec<&str>>,
+        max_retries: u32,
+        restart_delay_ms: u64,
+        stability_threshold_ms: u64,
+    ) -> ProcessConfig {
+        ProcessConfig {
+            command: command.map(str::to_string),
+            args: args.map(|list| list.into_iter().map(str::to_string).collect()),
             external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 0,
-        };
-        let (_, mcp_rx) = mpsc::channel(1);
-        let _ = ProcessManager::monitor_process("test".to_string(), config, mcp_rx, rx).await;
+            max_retries,
+            restart_delay_ms,
+            stability_threshold_ms,
+        }
     }
 
+    /// Verifies `initialize`, `ping`, `notifications/initialized`, `tools/list`, and unsupported
+    /// method handling on [`ProcessManager`].
     #[tokio::test]
-    async fn test_process_manager_missing_command_and_external() {
-        let mut configs = HashMap::new();
-        configs.insert(
-            "bad".to_string(),
-            ProcessConfig {
-                command: None,
-                args: None,
-                external_address: None,
-                max_retries: default_max_retries(),
-                restart_delay_ms: default_restart_delay_ms(),
-            },
-        );
-        let pm = ProcessManager::new(configs);
-        let _ = pm.start_all().await;
-        let () = pm.stop_all().await;
-    }
-
-    #[tokio::test]
-    async fn test_mcp_orchestrator_tools_list() {
+    async fn test_mcp_orchestrator_lifecycle_and_tools_list() -> Result<(), CddEngineError> {
         let pm = ProcessManager::new(HashMap::new());
-        let req = McpRequest {
-            jsonrpc: "2.0".to_string(),
+        assert!(pm.configs().is_empty());
+        assert_eq!(pm.active_daemon_count().await, 0);
+
+        // 1. initialize
+        let init_query = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "initialize".to_string(),
+            params: None,
+            id: Some(RequestId::Number(1)),
+        };
+        let init_reply = pm.handle_request(init_query).await?;
+        assert_eq!(init_reply.id, Some(RequestId::Number(1)));
+        let init_body: InitializeResult = serde_json::from_value(
+            init_reply
+                .result
+                .ok_or_else(|| CddEngineError::Internal("missing result".into()))?,
+        )?;
+        assert_eq!(init_body.protocol_version, MCP_PROTOCOL_VERSION);
+        assert_eq!(init_body.server_info.name, "cdd-engine");
+
+        // 2. ping & notifications/initialized
+        let ping_query = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "ping".to_string(),
+            params: None,
+            id: Some(RequestId::from("ping-1")),
+        };
+        let ping_reply = pm.handle_request(ping_query).await?;
+        assert_eq!(ping_reply.id, Some(RequestId::from("ping-1")));
+        assert_eq!(ping_reply.result, Some(serde_json::json!({})));
+
+        // 3. tools/list
+        let list_query = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
             method: "tools/list".to_string(),
             params: None,
-            id: Some(serde_json::json!(1)),
+            id: Some(RequestId::Number(2)),
         };
-        let res = pm.handle_request(req).await.expect("tools/list failed");
-        assert_eq!(res.id.expect("daemon test expect"), serde_json::json!(1));
-        assert!(res.result.is_some());
-    }
+        let list_reply = pm.handle_request(list_query).await?;
+        let tools_body: ListToolsResult = serde_json::from_value(
+            list_reply
+                .result
+                .ok_or_else(|| CddEngineError::Internal("missing result".into()))?,
+        )?;
+        assert_eq!(tools_body.tools.len(), 1);
+        assert_eq!(tools_body.tools[0].name, "cdd_generate_sdk");
 
-    #[tokio::test]
-    async fn test_mcp_orchestrator_tools_call_missing_args() {
-        let pm = ProcessManager::new(HashMap::new());
-        let req = McpRequest {
-            jsonrpc: "2.0".to_string(),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({})),
-            id: Some(serde_json::json!(2)),
+        // 4. Unsupported method
+        let unknown_query = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "resources/list".to_string(),
+            params: None,
+            id: Some(RequestId::Number(3)),
         };
-        let res = pm.handle_request(req).await;
-        println!("ERROR: {:?}", res.as_ref().err().unwrap());
-        assert!(res.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_mcp_orchestrator_tools_call_not_found() {
-        let pm = ProcessManager::new(HashMap::new());
-        let req = McpRequest {
-            jsonrpc: "2.0".to_string(),
-            method: "tools/call".to_string(),
-            params: Some(serde_json::json!({
-                "arguments": {
-                    "target_language": "rust"
-                }
-            })),
-            id: Some(serde_json::json!(3)),
-        };
-        let res = pm.handle_request(req).await;
-        println!("ERROR: {:?}", res.as_ref().err().unwrap());
-        assert!(res.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_process_manager_local_stop_all() -> Result<(), CddEngineError> {
-        let mut configs = HashMap::new();
-        configs.insert(
-            "test-echo".to_string(),
-            ProcessConfig {
-                command: Some("echo".to_string()),
-                args: Some(vec!["hello".to_string()]),
-                external_address: None,
-                max_retries: 1,
-                restart_delay_ms: 100,
-            },
-        );
-        let manager = ProcessManager::new(configs);
-        manager.start_all().await.expect("start");
-
-        {
-            let handles = manager.handles.lock().await;
-            assert_eq!(handles.len(), 1);
-            assert!(handles.contains_key("test-echo"));
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        manager.stop_all().await;
+        let unknown_reply = pm.handle_request(unknown_query).await;
+        assert!(matches!(
+            unknown_reply,
+            Err(CddEngineError::ProtocolViolation(_))
+        ));
 
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod more_tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-    use super::*;
-
+    /// Verifies validation errors and missing daemon errors for `tools/call`.
     #[tokio::test]
-    async fn test_daemon_coverage() {
-        let pm = ProcessManager::new(std::collections::HashMap::new());
-        let req = McpRequest {
-            jsonrpc: "2".into(),
-            method: "unknown_method".into(),
+    async fn test_mcp_orchestrator_tools_call_validation_and_not_found() {
+        let pm = ProcessManager::new(HashMap::new());
+
+        // Missing params
+        let req_no_params = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
             params: None,
-            id: None,
+            id: Some(RequestId::Number(1)),
         };
-        let _ = pm.handle_request(req).await;
-        pm.stop_all().await;
+        assert!(matches!(
+            pm.handle_request(req_no_params).await,
+            Err(CddEngineError::Validation(_))
+        ));
+
+        // Invalid params structure
+        let req_bad_params = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({"arguments": {}})),
+            id: Some(RequestId::Number(2)),
+        };
+        assert!(matches!(
+            pm.handle_request(req_bad_params).await,
+            Err(CddEngineError::Validation(_))
+        ));
+
+        // Valid params, daemon not registered
+        let req_not_found = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "cdd_generate_sdk",
+                "arguments": {
+                    "target_language": "python",
+                    "input": "spec.json"
+                }
+            })),
+            id: Some(RequestId::Number(3)),
+        };
+        assert!(matches!(
+            pm.handle_request(req_not_found).await,
+            Err(CddEngineError::NotFound(_))
+        ));
     }
 
+    /// Verifies `start_all` skipping behavior for `external_address` and missing `command`, plus
+    /// direct `monitor_process` invocation when `command` is `None`.
     #[tokio::test]
-    async fn test_daemon_external_address() {
-        let mut configs = std::collections::HashMap::new();
+    async fn test_start_all_external_and_missing_command() {
+        let mut configs = HashMap::new();
         configs.insert(
-            "ext".to_string(),
+            "cdd-ext".to_string(),
             ProcessConfig {
                 command: None,
                 args: None,
-                external_address: Some("127.0.0.1:9090".to_string()),
-                max_retries: 0,
-                restart_delay_ms: 0,
-            },
-        );
-        let pm = ProcessManager::new(configs);
-        let _ = pm.start_all().await;
-    }
-
-    #[tokio::test]
-    async fn test_daemon_dummy_proc() {
-        let mut configs = std::collections::HashMap::new();
-        configs.insert(
-            "dummy".to_string(),
-            ProcessConfig {
-                command: Some("echo".to_string()),
-                args: Some(vec!["test".to_string()]),
-                external_address: None,
-                max_retries: 0,
-                restart_delay_ms: 0,
-            },
-        );
-        let pm = ProcessManager::new(configs);
-        let _ = pm.start_all().await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    }
-
-    #[tokio::test]
-    async fn test_daemon_dropped_response() {
-        let config = ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "exit 0".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 0,
-        };
-        let mut configs = HashMap::new();
-        configs.insert("drop-test".to_string(), config);
-        let pm = ProcessManager::new(configs);
-        let _ = pm.start_all().await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        let req = McpRequest {
-            jsonrpc: "2.0".into(),
-            method: "tools/call".into(),
-            params: Some(serde_json::json!({
-                "arguments": {
-                    "target_language": "drop-test"
-                }
-            })),
-            id: Some(serde_json::json!(101)),
-        };
-        let res = pm.handle_request(req).await;
-        println!("ERROR: {:?}", res.as_ref().err().unwrap());
-        assert!(res.is_err());
-        pm.stop_all().await;
-    }
-
-    #[tokio::test]
-    async fn test_daemon_mcp_real() {
-        let mut configs = std::collections::HashMap::new();
-        configs.insert(
-            "echo".to_string(),
-            ProcessConfig {
-                command: Some("echo".to_string()),
-                args: Some(vec!["test".to_string()]),
-                external_address: None,
-                max_retries: 0,
-                restart_delay_ms: 0,
-            },
-        );
-        let pm = ProcessManager::new(configs);
-        let _ = pm.start_all().await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let req = McpRequest {
-            jsonrpc: "2.0".into(),
-            method: "some_method".into(),
-            params: None,
-            id: Some(serde_json::json!(1)),
-        };
-        let _ = pm.handle_request(req).await;
-
-        let req_noid = McpRequest {
-            jsonrpc: "2.0".into(),
-            method: "some_method".into(),
-            params: None,
-            id: None,
-        };
-        let _ = pm.handle_request(req_noid).await;
-
-        pm.stop_all().await;
-        let req = McpRequest {
-            jsonrpc: "2.0".into(),
-            method: "some_method".into(),
-            params: None,
-            id: Some(serde_json::json!(1)),
-        };
-        let _ = pm.handle_request(req).await;
-    }
-
-    #[tokio::test]
-    async fn test_daemon_coverage_cases() {
-        use crate::mcp::McpRequest;
-        use tokio::sync::{mpsc, oneshot, watch};
-
-        let config_fail = ProcessConfig {
-            command: Some("does_not_exist_xyz123".to_string()),
-            args: Some(vec![]),
-            external_address: None,
-            max_retries: 1,
-            restart_delay_ms: 10,
-        };
-        let (_, rx) = mpsc::channel(1);
-        let (_, watch_rx) = watch::channel(false);
-        let handle = tokio::spawn(ProcessManager::monitor_process(
-            "test1".to_string(),
-            config_fail,
-            rx,
-            watch_rx,
-        ));
-        let _ = handle.await;
-
-        let config_succ = ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec![
-                "-c".to_string(),
-                "echo '{\"jsonrpc\": \"2.0\", \"id\": 1}' >&1; echo \"non-json-line\" >&2; exit 0"
-                    .to_string(),
-            ]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 10,
-        };
-        let (tx, rx) = mpsc::channel(1);
-        let (watch_tx, watch_rx) = watch::channel(false);
-        let handle2 = tokio::spawn(ProcessManager::monitor_process(
-            "test2".to_string(),
-            config_succ,
-            rx,
-            watch_rx.clone(),
-        ));
-
-        let _ = watch_tx.send(true); // hit shutdown branch
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let req = McpRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::Value::Number(1.into())),
-            method: "test".to_string(),
-            params: None,
-        };
-        let _ = tx.send((req.clone(), reply_tx)).await;
-
-        let _ = reply_rx.await;
-        let _ = handle2.await;
-
-        let config_succ2 = ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "sleep 1".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 10,
-        };
-        let (tx2, rx2) = mpsc::channel(1);
-        let (_, watch_rx2) = watch::channel(false);
-        let handle3 = tokio::spawn(ProcessManager::monitor_process(
-            "test3".to_string(),
-            config_succ2,
-            rx2,
-            watch_rx2,
-        ));
-
-        let (reply_tx2, _) = oneshot::channel();
-        let req_no_id = McpRequest {
-            jsonrpc: "2.0".to_string(),
-            id: None,
-            method: "test".to_string(),
-            params: None,
-        };
-        let _ = tx2.send((req_no_id, reply_tx2)).await;
-
-        // Wait, hit channel drop
-        drop(tx2);
-
-        // write broken pipe
-        let (tx3, rx3) = mpsc::channel(1);
-        let (_, watch_rx3) = watch::channel(false);
-        let handle4 = tokio::spawn(ProcessManager::monitor_process(
-            "test4".to_string(),
-            ProcessConfig {
-                command: Some("sh".to_string()),
-                args: Some(vec!["-c".to_string(), "exit 1".to_string()]),
-                external_address: None,
+                external_address: Some("http://localhost:8001".to_string()),
                 max_retries: 0,
                 restart_delay_ms: 10,
+                stability_threshold_ms: 100,
             },
-            rx3,
-            watch_rx3,
-        ));
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let (reply_tx3, _) = oneshot::channel();
-        let req3 = McpRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::Value::Number(3.into())),
-            method: "test".to_string(),
-            params: None,
-        };
-        let _ = tx3.send((req3, reply_tx3)).await;
+        );
+        configs.insert(
+            "cdd-invalid".to_string(),
+            make_process_config(None, None, 0, 10, 100),
+        );
 
-        let _ = handle3.await;
-        let _ = handle4.await;
+        let pm = ProcessManager::new(configs);
+        pm.start_all().await;
+        assert_eq!(pm.active_daemon_count().await, 0);
+        pm.stop_all().await;
 
-        // Hit "Channel closed" in handle_request map_err
-        let req_closed = McpRequest {
-            jsonrpc: "2.0".to_string(),
+        let (_tx, rx) = tokio::sync::broadcast::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        ProcessManager::monitor_process(
+            "none".to_string(),
+            make_process_config(None, None, 0, 10, 100),
+            rx,
+            cmd_rx,
+        )
+        .await;
+    }
+
+    /// Verifies full end-to-end JSON-RPC request/response correlation, malformed stdout lines,
+    /// unmatched response IDs, stderr logging, and missing request IDs with a live shell child.
+    #[tokio::test]
+    async fn test_daemon_live_stdio_communication() -> Result<(), CddEngineError> {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "cdd-python".to_string(),
+            make_process_config(
+                Some("sh"),
+                Some(vec![
+                    "-c",
+                    r#"echo 'err_msg' >&2; echo 'not_json'; echo '{"jsonrpc":"2.0","result":{},"id":999}'; while read line; do echo '{"jsonrpc":"2.0","result":{"status":"ok"},"id":1}'; done; sleep 10"#,
+                ]),
+                1,
+                20,
+                10,
+            ),
+        );
+
+        let pm = ProcessManager::new(configs);
+        pm.start_all().await;
+        assert_eq!(pm.active_daemon_count().await, 1);
+
+        // 1. Correlated request with id = 1
+        let req = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
             method: "tools/call".to_string(),
             params: Some(serde_json::json!({
+                "name": "cdd_generate_sdk",
                 "arguments": {
-                    "target_language": "closed_target"
+                    "target_language": "cdd-python",
+                    "input": "openapi.json"
                 }
             })),
-            id: Some(serde_json::json!(1)),
+            id: Some(RequestId::Number(1)),
         };
+        let res = pm.handle_request(req).await?;
+        assert_eq!(res.id, Some(RequestId::Number(1)));
+        assert_eq!(res.result, Some(serde_json::json!({"status": "ok"})));
 
-        // pm handles channels directly, need a dropped one
-        let mut configs_closed = std::collections::HashMap::new();
-        configs_closed.insert(
-            "cdd-closed_target".to_string(),
-            ProcessConfig {
-                command: Some("sh".to_string()),
-                args: Some(vec!["-c".to_string(), "exit 0".to_string()]),
-                external_address: None,
-                max_retries: 0,
-                restart_delay_ms: 0,
-            },
-        );
-        let pm_closed = ProcessManager::new(configs_closed);
-        pm_closed.start_all().await.expect("start");
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await; // let it exit
-        let res_closed = pm_closed.handle_request(req_closed.clone()).await;
-        println!("RES_CLOSED: {:?}", res_closed);
-        assert!(res_closed.is_err());
-
-        // write broken pipe directly to the child's channel
-        let (tx5, rx5) = mpsc::channel(1);
-        let (_, watch_rx5) = watch::channel(false);
-        let handle5 = tokio::spawn(ProcessManager::monitor_process(
-            "test5".to_string(),
-            ProcessConfig {
-                command: Some("sh".to_string()),
-                args: Some(vec!["-c".to_string(), "exit 1".to_string()]),
-                external_address: None,
-                max_retries: 0,
-                restart_delay_ms: 10,
-            },
-            rx5,
-            watch_rx5,
-        ));
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let (reply_tx5, _) = oneshot::channel();
-        let _ = tx5.send((req_closed.clone(), reply_tx5)).await;
-        let _ = handle5.await;
-
-        pm_closed.stop_all().await;
-    }
-
-    #[tokio::test]
-    async fn test_coverage_for_mcp_unmatched_id_and_timeout() {
-        let config = ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "sleep 0.1 && exit 0".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 10,
-        };
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        let (_watch_tx, watch_rx) = tokio::sync::watch::channel(false);
-
-        let handle = tokio::spawn(ProcessManager::monitor_process(
-            "test-cov".to_string(),
-            config,
-            rx,
-            watch_rx,
-        ));
-
-        // Test sending something while the process shuts down to hit branches
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        // We expect the handle to return now.
-        let _ = handle.await;
-    }
-
-    #[tokio::test]
-    async fn test_daemon_missing_req_id() {
-        let config = ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "cat".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 10,
-        };
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let (watch_tx, watch_rx) = tokio::sync::watch::channel(false);
-
-        let handle = tokio::spawn(ProcessManager::monitor_process(
-            "test-missing-id".to_string(),
-            config,
-            rx,
-            watch_rx,
-        ));
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Send a request without an ID
-        let req = McpRequest {
-            jsonrpc: "2.0".into(),
-            method: "test".into(),
-            params: None,
+        // 2. Request without id (rejected as ProtocolViolation)
+        let req_no_id = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "cdd_generate_sdk",
+                "arguments": {
+                    "target_language": "python",
+                    "input": "openapi.json"
+                }
+            })),
             id: None,
         };
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-        let _ = tx.send((req, reply_tx)).await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = watch_tx.send(true);
-        let _ = handle.await;
-    }
-
-    #[tokio::test]
-    async fn test_hit_none_branch_stdin() {
-        let config = ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "sleep 5".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 10,
-        };
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let (watch_tx, watch_rx) = tokio::sync::watch::channel(false);
-
-        let handle = tokio::spawn(ProcessManager::monitor_process(
-            "test-stdin".to_string(),
-            config,
-            rx,
-            watch_rx,
+        let no_id_res = pm.handle_request(req_no_id).await;
+        assert!(matches!(
+            no_id_res,
+            Err(CddEngineError::ProtocolViolation(_))
         ));
 
-        // drop the sender to send None
-        drop(tx);
-
-        // give it a moment to process the drop, then signal shutdown to prevent hanging
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = watch_tx.send(true);
-
-        let _ = handle.await;
-    }
-    #[tokio::test]
-    async fn test_daemon_coverage_outer_break() {
-        use crate::daemon::{ProcessConfig, ProcessManager};
-        use tokio::sync::{mpsc, watch};
-        let config = ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "sleep 10".to_string()]),
-            external_address: None,
-            max_retries: 5,
-            restart_delay_ms: 0,
-        };
-        let (_, rx) = mpsc::channel(1);
-        let (watch_tx, watch_rx) = watch::channel(false);
-        let handle = tokio::spawn(ProcessManager::monitor_process(
-            "test_outer_break".to_string(),
-            config,
-            rx,
-            watch_rx,
-        ));
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let _ = watch_tx.send(true);
-        let _ = handle.await;
-    }
-    #[tokio::test]
-    async fn test_daemon_mcp_response_coverage() {
-        use crate::daemon::{ProcessConfig, ProcessManager};
-        use crate::mcp::McpRequest;
-        let mut configs = std::collections::HashMap::new();
-        configs.insert(
-            "cdd-responder".to_string(),
-            ProcessConfig {
-                command: Some("sh".to_string()),
-                args: Some(vec![
-                    "-c".to_string(),
-                    "read line; echo '{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{}}'".to_string(),
-                ]),
-                external_address: None,
-                max_retries: 0,
-                restart_delay_ms: 0,
-            },
-        );
-        let pm = ProcessManager::new(configs);
-        let _ = pm.start_all().await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        let req = McpRequest {
-            jsonrpc: "2.0".into(),
-            method: "tools/call".into(),
-            params: Some(serde_json::json!({
-                "arguments": {
-                    "target_language": "responder"
-                }
-            })),
-            id: Some(serde_json::json!(99)),
-        };
-        let res = pm.handle_request(req).await;
-        assert!(res.is_ok());
         pm.stop_all().await;
+        assert_eq!(pm.active_daemon_count().await, 0);
+        Ok(())
     }
 
+    /// Verifies retry exhaustion, stability threshold reset, and shutdown during retry delay.
     #[tokio::test]
-    async fn test_daemon_shutdown_flow() {
-        let config = ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "sleep 10".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 10,
-        };
-        let (_tx, rx) = mpsc::channel(1);
-        let (watch_tx, watch_rx) = watch::channel(false);
-
-        let handle = tokio::spawn(ProcessManager::monitor_process(
-            "test-shutdown".to_string(),
-            config,
-            rx,
-            watch_rx,
-        ));
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = watch_tx.send(true);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
-            .await
-            .expect("shutdown test timeout");
-    }
-}
-
-#[cfg(test)]
-mod rx_test {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-    use super::*;
-    use std::collections::HashMap;
-
-    #[tokio::test]
-    async fn test_daemon_dropped_response_rx_err() {
-        let config = ProcessConfig {
-            command: Some("sh".to_string()),
-            args: Some(vec!["-c".to_string(), "read line; exit 0".to_string()]),
-            external_address: None,
-            max_retries: 0,
-            restart_delay_ms: 0,
-        };
+    async fn test_daemon_retry_and_shutdown_flows() {
         let mut configs = HashMap::new();
-        configs.insert("cdd-drop-rx-test".to_string(), config);
+        // 1. Process that runs longer than stability_threshold_ms (5ms) so retries reset to 0, then stops via shutdown
+        configs.insert(
+            "cdd-stable-reset".to_string(),
+            make_process_config(Some("sh"), Some(vec!["-c", "sleep 0.02"]), 0, 500, 5),
+        );
+        // 2. Process that exits faster than stability_threshold_ms (5000ms) and exhausts max_retries = 0
+        configs.insert(
+            "cdd-fast-exit".to_string(),
+            make_process_config(Some("sh"), Some(vec!["-c", "exit 0"]), 0, 10, 5000),
+        );
+        // 3. Process that fails to spawn and retries once
+        configs.insert(
+            "cdd-non-existent".to_string(),
+            make_process_config(Some("/non_existent_binary_cdd_999"), None, 1, 10, 5000),
+        );
+
         let pm = ProcessManager::new(configs);
-        let _ = pm.start_all().await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        pm.start_all().await;
+        sleep(Duration::from_millis(80)).await;
+        pm.stop_all().await;
+
+        // Shutdown during restart sleep delay
+        let mut delay_configs = HashMap::new();
+        delay_configs.insert(
+            "cdd-delay-shutdown".to_string(),
+            make_process_config(Some("/non_existent_binary_cdd_999"), None, 3, 5000, 5000),
+        );
+        let pm_delay = ProcessManager::new(delay_configs);
+        pm_delay.start_all().await;
+        sleep(Duration::from_millis(20)).await;
+        pm_delay.stop_all().await;
+    }
+
+    /// Verifies that when a child process exits before replying, or when the command channel closes,
+    /// deterministic errors are returned.
+    #[tokio::test]
+    async fn test_daemon_exits_before_response_and_channel_closed() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "cdd-crash".to_string(),
+            make_process_config(
+                Some("sh"),
+                Some(vec!["-c", "read line; exit 1"]),
+                0,
+                10,
+                5000,
+            ),
+        );
+
+        let pm = ProcessManager::new(configs);
+        pm.start_all().await;
 
         let req = McpRequest {
-            jsonrpc: "2.0".into(),
-            method: "tools/call".into(),
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
             params: Some(serde_json::json!({
-                "arguments": {
-                    "target_language": "drop-rx-test"
-                }
+                "arguments": { "target_language": "crash" }
             })),
-            id: Some(serde_json::json!(102)),
+            id: Some(RequestId::Number(101)),
         };
-        let res = pm.handle_request(req).await;
-        println!("ERROR: {:?}", res.as_ref().err().unwrap());
+        let res = pm.handle_request(req.clone()).await;
         assert!(res.is_err());
+
+        // Wait for monitor_process to finish after max_retries = 0, then send again to hit closed channel
+        sleep(Duration::from_millis(40)).await;
+        let res_closed = pm.handle_request(req).await;
+        assert!(matches!(res_closed, Err(CddEngineError::Mcp(_))));
+
         pm.stop_all().await;
+    }
+
+    /// Verifies per-request timeout when a child daemon hangs and clean exit when
+    /// `active_channels` is cleared.
+    #[tokio::test]
+    async fn test_daemon_cmd_channel_dropped() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "cdd-sleep".to_string(),
+            make_process_config(Some("sh"), Some(vec!["-c", "sleep 5"]), 0, 10, 5000),
+        );
+        let pm = ProcessManager::with_timeout(configs, 15);
+        pm.start_all().await;
+
+        let req = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "arguments": { "target_language": "sleep" }
+            })),
+            id: Some(RequestId::Number(404)),
+        };
+        let timeout_res = pm.handle_request(req).await;
+        assert!(matches!(timeout_res, Err(CddEngineError::Mcp(_))));
+
+        pm.active_channels.lock().await.clear();
+        sleep(Duration::from_millis(20)).await;
+        pm.stop_all().await;
+    }
+
+    /// Verifies `forward_request_to_stdin` error handling when writing to a closed child `stdin` pipe.
+    #[tokio::test]
+    async fn test_forward_request_broken_stdin_pipe() -> Result<(), CddEngineError> {
+        let cfg = make_process_config(
+            Some("sh"),
+            Some(vec!["-c", "exec 0<&-; sleep 0.2"]),
+            0,
+            10,
+            5000,
+        );
+        let mut pipes = ProcessManager::spawn_child_pipes("sh", &cfg)?;
+        drop(pipes.stdout);
+        drop(pipes.stderr);
+
+        // Give child shell a moment to close its stdin descriptor
+        sleep(Duration::from_millis(40)).await;
+        let pending: PendingRequestsMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // Write a large payload so the OS pipe buffer overflows and triggers EPIPE immediately
+        let large_input = "x".repeat(512 * 1024);
+        let req = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "data": large_input })),
+            id: Some(RequestId::Number(77)),
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let write_res =
+            ProcessManager::forward_request_to_stdin(&mut pipes.stdin, &req, reply_tx, &pending)
+                .await;
+        assert!(write_res.is_err());
+        let reply = reply_rx.await?;
+        assert!(matches!(reply, Err(CddEngineError::Io(_))));
+
+        let _ = pipes.child.kill().await;
+        Ok(())
     }
 }

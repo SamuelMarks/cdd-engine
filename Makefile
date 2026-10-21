@@ -1,81 +1,66 @@
-.PHONY: all help install_base install_deps docs build_docs build test run build_docker run_docker
+.PHONY: all help install_base install_deps docs build_docs build lint test coverage build_docker run_docker
 
 DOCS_DIR ?= docs
-BIN_DIR ?= bin
 
 all: help
 
 help:
 	@echo "Available commands:"
-	@echo "  install_base   - Install language runtime (Rust, Node.js, etc.)"
-	@echo "  install_deps   - Install local dependencies (cargo build, npm install)"
-	@echo "  docs           - Generate API docs and symlink to ./docs/html"
-	@echo "  build_docs [DOCS_DIR=docs] - Build the API docs and put them in the specified directory"
-	@echo "  build [BIN_DIR=bin]        - Build the cdd-ctl backend and package all cdd-* WASM projects"
-	@echo "  test           - Run tests locally"
-	@echo "  run            - Run the API server and the Angular frontend (ng serve)"
-	@echo "  build_docker   - Build alpine and debian Docker images"
-	@echo "  run_docker     - Run the docker image, test the API, and stop"
+	@echo "  install_base   - Install language toolchains (Rust)"
+	@echo "  install_deps   - Install project dependencies & WASM targets"
+	@echo "  build_docs     - Build the API documentation"
+	@echo "  docs           - Build and prepare documentation in $(DOCS_DIR)"
+	@echo "  build          - Build the cdd-engine library"
+	@echo "  lint           - Run cargo fmt and clippy with -D warnings"
+	@echo "  test           - Run the test suite"
+	@echo "  coverage       - Run test and documentation coverage verification"
+	@echo "  build_docker   - Build Alpine and Debian Docker images"
+	@echo "  run_docker     - Run verification inside Docker containers"
 
 install_base:
-	@echo "Installing base tools..."
-	curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-	@if [ -f /etc/debian_version ]; then \
-		sudo apt-get update && sudo apt-get install -y gcc pkg-config curl; \
-		curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -; \
-		sudo apt-get install -y nodejs; \
-	elif [ -f /etc/alpine-release ]; then \
-		sudo apk add --no-cache gcc pkgconfig curl nodejs npm; \
-	elif [ -f /etc/redhat-release ]; then \
-		sudo dnf install -y gcc pkgconf curl nodejs npm; \
-	fi
+	@echo "Checking for cargo..."
+	@command -v cargo >/dev/null 2>&1 || { echo "Installing Rust..."; curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; }
 
-install_deps:
-	@echo "Installing local dependencies..."
+install_deps: install_base
+	@echo "Fetching cargo dependencies..."
 	cargo fetch
-
-docs:
-	@echo "Generating API docs..."
-	cargo doc --no-deps
-	mkdir -p docs
-	rm -rf docs/html
-	ln -s ../target/doc docs/html
-	echo '<meta http-equiv="refresh" content="0; url=cdd_ctl/index.html">' > target/doc/index.html
+	@echo "Acquiring WASM binaries for cdd-* ecosystems..."
+	@chmod +x scripts/fetch_wasm.sh
+	@./scripts/fetch_wasm.sh
 
 build_docs:
-	@echo "Building API docs into $(DOCS_DIR)..."
-	mkdir -p $(DOCS_DIR)
-	cargo doc --no-deps --target-dir $(DOCS_DIR)
+	@echo "Generating Rust documentation into $(DOCS_DIR)..."
+	cargo doc --no-deps --target-dir $(DOCS_DIR)_tmp
+	@mkdir -p $(DOCS_DIR)
+	@cp -r $(DOCS_DIR)_tmp/doc/* $(DOCS_DIR)/
+	@rm -rf $(DOCS_DIR)_tmp
+
+docs: build_docs
+	@echo "Documentation generated in $(DOCS_DIR)/cdd_engine/index.html"
+	@echo '<meta http-equiv="refresh" content="0; url=cdd_engine/index.html">' > $(DOCS_DIR)/index.html
 
 build:
-	@echo "Building cdd-ctl Rust server..."
-	cargo build --release --out-dir $(BIN_DIR) -Z unstable-options || cargo build --release
-	@echo "Copying built binary to $(BIN_DIR)"
-	mkdir -p $(BIN_DIR)
-	cp target/release/cdd-ctl $(BIN_DIR)/
-	./scripts/fetch_wasm.sh
-	@echo "Mocking build of Angular website and WASM integration of cdd-* projects..."
+	@echo "Building cdd-engine..."
+	cargo build --release
+
+lint:
+	cargo fmt --all -- --check
+	cargo clippy --all-targets --all-features -- -D warnings
 
 test:
-	@echo "Running tests..."
-	cargo test
+	@echo "Running unit tests..."
+	cargo test --all-targets
 
-run:
-	@echo "Starting cdd-ctl in background and running ng serve..."
-	cargo run & echo $$! > cdd-ctl.pid
-	echo "Running ng serve for frontend..."
-	sleep 5
-	kill `cat cdd-ctl.pid`
+coverage:
+	@chmod +x scripts/update_shields.sh
+	@./scripts/update_shields.sh
 
 build_docker:
-	docker build -t cdd-ctl:alpine -f alpine.Dockerfile .
-	docker build -t cdd-ctl:debian -f debian.Dockerfile .
+	@echo "Building Docker images..."
+	docker build -f alpine.Dockerfile -t cdd-engine:alpine .
+	docker build -f debian.Dockerfile -t cdd-engine:debian .
 
-run_docker:
-	docker run -d --name cdd-ctl-test -p 8080:8080 cdd-ctl:alpine
-	@echo "Waiting for server to start..."
-	sleep 5
-	curl -s http://localhost:8080/version || echo "Failed to reach server"
-	docker stop cdd-ctl-test
-	docker rm cdd-ctl-test
-	docker rmi cdd-ctl:alpine cdd-ctl:debian
+run_docker: build_docker
+	@echo "Running cdd-engine test suite in Alpine container..."
+	docker run --rm cdd-engine:alpine
+	docker rmi cdd-engine:alpine cdd-engine:debian

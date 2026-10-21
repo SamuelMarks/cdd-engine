@@ -2,33 +2,40 @@
 name = "cdd-engine"
 version = "0.0.1"
 edition = "2021"
+description = "Core daemon manager, MCP orchestrator, and WebAssembly execution engine for the cdd-* toolchain."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/SamuelMarks/cdd-engine"
+readme = "README.md"
+keywords = ["openapi", "codegen", "wasm", "mcp", "wasi"]
+categories = ["development-tools", "wasm", "web-programming"]
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "process", "sync", "time", "io-util", "macros"] }
-log = "0.4"
-env_logger = "0.11"
-derive_more = { version = "1.0", features = ["display", "error", "from"] }
-config = "0.15.19"
-wasmtime = "45"
-wasmtime-wasi = "45"
-rquickjs = "0.12.0"
-async-trait = "0.1.89"
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokio = { version = "1.54", default-features = false, features = ["rt", "process", "sync", "time", "io-util", "macros"] }
+log = { version = "0.4", default-features = false }
+derive_more = { version = "2.1", default-features = false, features = ["std", "display", "error", "from"] }
+config = { version = "0.15", default-features = false, features = ["toml"] }
+wasmtime = { version = "50.0", default-features = false, features = ["std", "runtime", "cranelift"] }
+wasmtime-wasi = { version = "50.0", default-features = false, features = ["p1"] }
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
-wat = "1.252.0"
+wat = { version = "1.262", default-features = false }
 
 [lints.rust]
+missing_docs = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)', 'cfg(tarpaulin)'] }
 
 [lints.clippy]
-all = "warn"
-pedantic = "warn"
-nursery = "warn"
-unwrap_used = "warn"
-expect_used = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+missing_docs_in_private_items = "deny"
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
 
 [profile.release]
 opt-level = 'z'       # Optimize for size
