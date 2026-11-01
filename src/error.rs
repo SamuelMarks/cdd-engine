@@ -81,6 +81,12 @@ pub enum CddEngineError {
     #[from(ignore)]
     Validation(String),
 
+    /// Unrecognized or malformed input specification (Swagger 2.0, `OpenAPI` 3.x, Arazzo 1.x, or Google Discovery).
+    #[display("Invalid Specification: {_0}")]
+    #[error(ignore)]
+    #[from(ignore)]
+    InvalidSpecification(String),
+
     /// UTF-8 string conversion error when reading from WASM memory or process output.
     #[display("UTF-8 Validation Error: {_0}")]
     Utf8(std::string::FromUtf8Error),
@@ -127,7 +133,10 @@ impl CddEngineError {
             Self::Json(_) => JSONRPC_PARSE_ERROR,
             Self::ProtocolViolation(_) => JSONRPC_INVALID_REQUEST,
             Self::NotFound(_) => JSONRPC_METHOD_NOT_FOUND,
-            Self::Validation(_) | Self::Utf8(_) | Self::TryFromInt(_) => JSONRPC_INVALID_PARAMS,
+            Self::Validation(_)
+            | Self::InvalidSpecification(_)
+            | Self::Utf8(_)
+            | Self::TryFromInt(_) => JSONRPC_INVALID_PARAMS,
             Self::Wasm(_)
             | Self::Command(_)
             | Self::ProcessSpawn(_)
@@ -200,6 +209,13 @@ mod tests {
         let val_err = CddEngineError::Validation("missing param".into());
         assert_eq!(val_err.to_string(), "Validation Error: missing param");
         assert_eq!(val_err.jsonrpc_error_code(), JSONRPC_INVALID_PARAMS);
+
+        let spec_err = CddEngineError::InvalidSpecification("unknown format".into());
+        assert_eq!(
+            spec_err.to_string(),
+            "Invalid Specification: unknown format"
+        );
+        assert_eq!(spec_err.jsonrpc_error_code(), JSONRPC_INVALID_PARAMS);
 
         let utf8_res = String::from_utf8(vec![0xff, 0xfe]);
         if let Err(raw_utf8) = utf8_res {

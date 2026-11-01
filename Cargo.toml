@@ -1,6 +1,6 @@
 [package]
 name = "cdd-engine"
-version = "0.0.1"
+version = "0.0.5"
 edition = "2021"
 description = "Core daemon manager, MCP orchestrator, and WebAssembly execution engine for the cdd-* toolchain."
 license = "MIT OR Apache-2.0"

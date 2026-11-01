@@ -54,9 +54,14 @@ To support purely offline and sandboxed generation (e.g., when requested directl
 - **WASI Integration:** Provides virtualized filesystem access and standard streams mapping.
 - **GraalVM Linker (`src/graalvm_linker.rs`):** Specifically handles complex linking requirements for Java/JVM-based generators compiled via GraalVM to WASM.
 
-### 3. Model Context Protocol (`src/mcp.rs`)
+### 3. Model Context Protocol, Multi-Spec Detection & Compiler Options (`src/mcp.rs`)
 
-Provides integration with the Model Context Protocol, enabling advanced context management and AI-driven interactions within the generation pipeline.
+Provides strongly typed integration with the Model Context Protocol (`RequestId`, `TargetLanguage`, `McpRequest`, `McpResponse`, `CallToolParams`, `GenerateSdkArguments`, `CallToolResult`) along with deterministic specification format routing and batch repository layout partitioning:
+
+- **Multi-Specification Format Detection (`SpecFormat`)**: Inspects JSON or YAML input documents to identify **OpenAPI 3.0/3.1/3.2** (`SpecFormat::OpenApi3`), **Swagger 2.0** (`SpecFormat::Swagger2`), **Arazzo 1.0/1.1.0** (`SpecFormat::Arazzo1`), and **Google API Discovery v1** (`SpecFormat::GoogleDiscovery1`).
+- **Automatic Google Discovery Pre-Conversion**: When a `SpecFormat::GoogleDiscovery1` document is submitted for a target other than `cdd-cpp` (or for `GeneratorTarget::ToDocsJson`), `cdd-engine` automatically invokes `cdd-cpp` (`from_google_discovery to_openapi`) first—either in-memory via `cdd-cpp.wasm` or over MCP via the `cdd-cpp` daemon—and forwards the resulting OpenAPI 3.2.0 specification to the target compiler.
+- **Strongly Typed Compiler Options (`CompilerOptions` & `GeneratorTarget`)**: Encapsulates `target` (`to_sdk`, `to_sdk_cli`, `to_server`, `to_docs_json`, `to_openapi`), `--mcp`, `--framework`, `--orm`, `--auto-admin`, `--tests`, `--no-github-actions`, `--no-installable-package`, `--no-imports`, and `--no-wrapping`.
+- **Monorepo vs. Polyrepo Output Partitioning (`RepoLayoutConfig` & `RepoLayoutMode`)**: Partitions multi-language batch generation outputs into either `<org>-sdk/<lang>/<file>` (`Monorepo`) or `<org>-sdk-<lang>/<file>` (`Polyrepo`).
 
 ## Configuration
 

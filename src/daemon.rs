@@ -4,14 +4,16 @@
 //!
 //! Provides [`ProcessConfig`] and [`ProcessManager`] to supervise long-running child processes,
 //! correlate asynchronous newline-delimited JSON-RPC 2.0 messages over `stdin`/`stdout`, capture
-//! and log `stderr`, and expose the [`McpOrchestrator`] trait interface.
+//! and log `stderr`, pre-convert Google Discovery v1 documents via `cdd-cpp`, and expose the
+//! [`McpOrchestrator`] trait interface.
 
 use crate::config::DEFAULT_REQUEST_TIMEOUT_MS;
 use crate::error::CddEngineError;
 use crate::mcp::{
-    CallToolParams, ImplementationInfo, InitializeResult, ListToolsResult, McpOrchestrator,
-    McpRequest, McpResponse, McpTool, RequestId, ServerCapabilities, ToolInputSchema,
-    ToolsCapability, MCP_PROTOCOL_VERSION,
+    CallToolParams, CallToolResult, CompilerOptions, GenerateSdkArguments, GeneratorTarget,
+    ImplementationInfo, InitializeResult, ListToolsResult, McpOrchestrator, McpRequest,
+    McpResponse, McpTool, RequestId, ServerCapabilities, SpecFormat, TargetLanguage, ToolContent,
+    ToolInputSchema, ToolsCapability, JSONRPC_VERSION, MCP_PROTOCOL_VERSION,
 };
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -183,6 +185,19 @@ impl ProcessManager {
     }
 
     /// Spawns a child process with piped `stdin`, `stdout`, and `stderr`.
+    ///
+    /// # Arguments
+    ///
+    /// * `cmd_str` - Executable command name or path.
+    /// * `config` - [`ProcessConfig`] containing optional CLI arguments.
+    ///
+    /// # Returns
+    ///
+    /// The [`SpawnedDaemonPipes`] containing child handle and stdio streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CddEngineError::ProcessSpawn`] if spawning the child fails.
     fn spawn_child_pipes(
         cmd_str: &str,
         config: &ProcessConfig,
@@ -222,6 +237,16 @@ impl ProcessManager {
 
     /// Spawns a task that reads newline-delimited JSON-RPC responses from child `stdout` and
     /// resolves matching entries in `pending_requests`.
+    ///
+    /// # Arguments
+    ///
+    /// * `daemon_name` - Name of the supervised daemon for logging.
+    /// * `stdout` - Child standard output pipe.
+    /// * `pending_requests` - Shared map of in-flight [`RequestId`]s.
+    ///
+    /// # Returns
+    ///
+    /// The spawned background task [`JoinHandle`].
     fn spawn_stdout_task(
         daemon_name: String,
         stdout: ChildStdout,
@@ -250,6 +275,15 @@ impl ProcessManager {
     }
 
     /// Spawns a task that reads and logs lines from child `stderr`.
+    ///
+    /// # Arguments
+    ///
+    /// * `daemon_name` - Name of the supervised daemon for logging.
+    /// * `stderr` - Child standard error pipe.
+    ///
+    /// # Returns
+    ///
+    /// The spawned background task [`JoinHandle`].
     fn spawn_stderr_task(daemon_name: String, stderr: ChildStderr) -> JoinHandle<()> {
         let mut stderr_reader = BufReader::new(stderr).lines();
         tokio::spawn(async move {
@@ -260,6 +294,11 @@ impl ProcessManager {
     }
 
     /// Fails all currently pending requests when a child process exits or crashes before replying.
+    ///
+    /// # Arguments
+    ///
+    /// * `pending_requests` - Shared map of in-flight [`RequestId`]s to drain and fail.
+    /// * `reason` - Error description sent to each waiting caller.
     async fn fail_pending_requests(pending_requests: &PendingRequestsMap, reason: &str) {
         let mut guard = pending_requests.lock().await;
         for (_, reply_tx) in guard.drain() {
@@ -269,6 +308,21 @@ impl ProcessManager {
 
     /// Serializes and writes an [`McpRequest`] to the child's `stdin`, registering `reply_tx` in
     /// `pending_requests` if the request has an `id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `stdin` - Mutable child standard input pipe.
+    /// * `req` - Outgoing [`McpRequest`].
+    /// * `reply_tx` - Oneshot channel to receive the daemon's response.
+    /// * `pending_requests` - Map of pending requests keyed by [`RequestId`].
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when the request is written (or rejected due to missing `id`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CddEngineError`] if JSON serialization or writing to `stdin` fails.
     async fn forward_request_to_stdin(
         stdin: &mut ChildStdin,
         req: &McpRequest,
@@ -302,6 +356,13 @@ impl ProcessManager {
     }
 
     /// Supervises a single child process across spawns, crash restarts, and graceful shutdown.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Daemon identifier.
+    /// * `config` - [`ProcessConfig`] settings for this daemon.
+    /// * `shutdown_rx` - Broadcast receiver signaling engine shutdown.
+    /// * `cmd_rx` - Channel receiving outgoing [`DaemonCommand`] tuples.
     #[allow(clippy::cognitive_complexity)]
     async fn monitor_process(
         name: String,
@@ -411,27 +472,81 @@ impl ProcessManager {
         info!("All managed processes stopped.");
     }
 
-    /// Builds the `tools/list` response listing the `cdd_generate_sdk` MCP tool.
+    /// Builds the `tools/list` response listing the `cdd_generate_sdk` MCP tool and all
+    /// supported per-language compiler options.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Originating request identifier.
+    ///
+    /// # Returns
+    ///
+    /// The populated `tools/list` [`McpResponse`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CddEngineError::Json`] if serialization fails.
     fn handle_tools_list(id: Option<RequestId>) -> Result<McpResponse, CddEngineError> {
         let tool = McpTool {
             name: "cdd_generate_sdk".to_string(),
             description:
-                "Generates an SDK or server stub using a specific cdd-* language toolchain."
+                "Generates an SDK, CLI, server stub, or docs JSON across all 13 cdd-* language toolchains."
                     .to_string(),
             input_schema: ToolInputSchema {
                 schema_type: "object".to_string(),
                 properties: serde_json::json!({
                     "target_language": {
                         "type": "string",
-                        "description": "The target language (e.g., python, rust, go, ts, csharp)."
+                        "description": "The target language (c, cpp, csharp, go, java, kotlin, php, python-all, ruby, rust, sh, swift, ts)."
                     },
                     "input": {
                         "type": "string",
-                        "description": "The input OpenAPI specification path or content."
+                        "description": "The input specification path or raw content (OpenAPI 3.x, Swagger 2.0, Arazzo 1.1.0, or Google Discovery v1)."
                     },
                     "output": {
                         "type": "string",
                         "description": "The output directory path."
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["to_sdk", "to_sdk_cli", "to_server", "to_docs_json", "to_openapi"],
+                        "description": "Target artifact type."
+                    },
+                    "mcp": {
+                        "type": "boolean",
+                        "description": "Whether to generate Model Context Protocol (--mcp) bindings."
+                    },
+                    "framework": {
+                        "type": "string",
+                        "description": "Optional target framework (e.g., angular, axum, fastapi)."
+                    },
+                    "orm": {
+                        "type": "string",
+                        "description": "Optional target ORM (e.g., diesel, sqlalchemy, prisma)."
+                    },
+                    "auto_admin": {
+                        "type": "boolean",
+                        "description": "Whether to generate an automatic admin interface (--auto-admin)."
+                    },
+                    "tests": {
+                        "type": "boolean",
+                        "description": "Whether to generate unit/conformance test suites (--tests)."
+                    },
+                    "no_github_actions": {
+                        "type": "boolean",
+                        "description": "Whether to omit .github/workflows CI scaffolding (--no-github-actions)."
+                    },
+                    "no_installable_package": {
+                        "type": "boolean",
+                        "description": "Whether to omit package manifest files (--no-installable-package)."
+                    },
+                    "no_imports": {
+                        "type": "boolean",
+                        "description": "Whether to omit imports (--no-imports)."
+                    },
+                    "no_wrapping": {
+                        "type": "boolean",
+                        "description": "Whether to omit outer wrapping (--no-wrapping)."
                     }
                 }),
                 required: vec!["target_language".to_string(), "input".to_string()],
@@ -447,6 +562,18 @@ impl ProcessManager {
     }
 
     /// Builds the `initialize` response advertising the engine's MCP protocol version and capabilities.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Originating request identifier.
+    ///
+    /// # Returns
+    ///
+    /// The populated `initialize` [`McpResponse`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CddEngineError::Json`] if serialization fails.
     fn handle_initialize(id: Option<RequestId>) -> Result<McpResponse, CddEngineError> {
         let init_result = InitializeResult {
             protocol_version: MCP_PROTOCOL_VERSION.to_string(),
@@ -463,19 +590,29 @@ impl ProcessManager {
         McpResponse::success(id, &init_result)
     }
 
-    /// Validates and routes a `tools/call` MCP request to the target `cdd-*` daemon.
-    async fn handle_tools_call(&self, request: McpRequest) -> Result<McpResponse, CddEngineError> {
-        let params_val = request
-            .params
-            .as_ref()
-            .ok_or_else(|| CddEngineError::Validation("Missing params".to_string()))?;
-        let call_params: CallToolParams = serde_json::from_value(params_val.clone())
-            .map_err(|e| CddEngineError::Validation(format!("Invalid tool call params: {e}")))?;
-
-        let daemon_name = call_params.arguments.target_language.daemon_name();
+    /// Dispatches a single [`McpRequest`] to a named daemon channel and awaits its response.
+    ///
+    /// # Arguments
+    ///
+    /// * `daemon_name` - Canonical daemon identifier (e.g., `"cdd-rust"`, `"cdd-cpp"`).
+    /// * `request` - The [`McpRequest`] to send.
+    ///
+    /// # Returns
+    ///
+    /// The correlated [`McpResponse`] from the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CddEngineError::NotFound`] if the daemon is not running, or [`CddEngineError::Mcp`]
+    /// if channel dispatch or timeout fails.
+    async fn send_to_daemon(
+        &self,
+        daemon_name: &str,
+        request: McpRequest,
+    ) -> Result<McpResponse, CddEngineError> {
         let sender = {
             let channels = self.active_channels.lock().await;
-            channels.get(&daemon_name).cloned().ok_or_else(|| {
+            channels.get(daemon_name).cloned().ok_or_else(|| {
                 CddEngineError::NotFound(format!("Daemon {daemon_name} not found or not running"))
             })?
         };
@@ -495,6 +632,112 @@ impl ProcessManager {
                     self.request_timeout_ms
                 ))
             })??
+    }
+
+    /// Pre-converts a Google Discovery v1 document into `OpenAPI` 3.2.0 by calling the `"cdd-cpp"`
+    /// daemon over MCP.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Request identifier to correlate the conversion call.
+    /// * `discovery_spec` - Raw Google Discovery v1 JSON/YAML string.
+    ///
+    /// # Returns
+    ///
+    /// The converted `OpenAPI` 3.2.0 specification string extracted from the `"cdd-cpp"` response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CddEngineError`] if `"cdd-cpp"` is not running, returns an error, or produces no
+    /// text output.
+    async fn convert_discovery_via_cpp_daemon(
+        &self,
+        id: Option<RequestId>,
+        discovery_spec: &str,
+    ) -> Result<String, CddEngineError> {
+        let cpp_params = CallToolParams {
+            name: Some("cdd_generate_sdk".to_string()),
+            arguments: GenerateSdkArguments {
+                target_language: TargetLanguage::Cpp,
+                input: Some(discovery_spec.to_string()),
+                output: None,
+                options: CompilerOptions {
+                    target: GeneratorTarget::ToOpenApi,
+                    ..CompilerOptions::default()
+                },
+            },
+        };
+        let cpp_req = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::to_value(&cpp_params)?),
+            id,
+        };
+
+        let cpp_resp = self.send_to_daemon("cdd-cpp", cpp_req).await?;
+        if let Some(err_obj) = cpp_resp.error {
+            return Err(CddEngineError::Mcp(format!(
+                "cdd-cpp Google Discovery conversion failed: {}",
+                err_obj.message
+            )));
+        }
+
+        if let Some(res_val) = cpp_resp.result {
+            if let Ok(tool_res) = serde_json::from_value::<CallToolResult>(res_val) {
+                if let Some(ToolContent::Text { text }) = tool_res.content.into_iter().next() {
+                    if !text.trim().is_empty() {
+                        return Ok(text);
+                    }
+                }
+            }
+        }
+
+        Err(CddEngineError::Mcp(
+            "cdd-cpp daemon did not return converted OpenAPI text content".to_string(),
+        ))
+    }
+
+    /// Validates and routes a `tools/call` MCP request to the target `cdd-*` daemon, automatically
+    /// pre-converting Google Discovery v1 documents via `"cdd-cpp"` when targeting another language.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - Incoming `tools/call` [`McpRequest`].
+    ///
+    /// # Returns
+    ///
+    /// The correlated [`McpResponse`] from the target daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CddEngineError`] if parameter validation, pre-conversion, or daemon dispatch fails.
+    async fn handle_tools_call(
+        &self,
+        mut request: McpRequest,
+    ) -> Result<McpResponse, CddEngineError> {
+        let params_val = request
+            .params
+            .as_ref()
+            .ok_or_else(|| CddEngineError::Validation("Missing params".to_string()))?;
+        let mut call_params: CallToolParams = serde_json::from_value(params_val.clone())
+            .map_err(|e| CddEngineError::Validation(format!("Invalid tool call params: {e}")))?;
+
+        let target_lang = &call_params.arguments.target_language;
+        if let Some(raw_input) = call_params.arguments.input.as_deref() {
+            if SpecFormat::detect(raw_input).ok() == Some(SpecFormat::GoogleDiscovery1)
+                && (*target_lang != TargetLanguage::Cpp
+                    || call_params.arguments.options.target == GeneratorTarget::ToDocsJson)
+            {
+                let converted = self
+                    .convert_discovery_via_cpp_daemon(request.id.clone(), raw_input)
+                    .await?;
+                call_params.arguments.input = Some(converted);
+                request.params = Some(serde_json::to_value(&call_params)?);
+            }
+        }
+
+        let daemon_name = call_params.arguments.target_language.daemon_name();
+        self.send_to_daemon(&daemon_name, request).await
     }
 }
 
@@ -519,7 +762,6 @@ mod tests {
     //! Unit tests for [`ProcessManager`], [`ProcessConfig`], and [`McpOrchestrator`] routing.
 
     use super::*;
-    use crate::mcp::JSONRPC_VERSION;
 
     /// Helper to build a default [`ProcessConfig`] for tests.
     fn make_process_config(
@@ -754,6 +996,177 @@ mod tests {
         pm.stop_all().await;
         assert_eq!(pm.active_daemon_count().await, 0);
         Ok(())
+    }
+
+    /// Verifies Google Discovery v1 pre-conversion via the `cdd-cpp` daemon before forwarding to
+    /// a target language daemon (plus error paths when `cdd-cpp` returns an error or empty content).
+    #[tokio::test]
+    async fn test_daemon_google_discovery_preconversion() -> Result<(), CddEngineError> {
+        let discovery_yaml = "discoveryVersion: v1\nname: compute\n";
+        let mut configs = HashMap::new();
+        configs.insert(
+            "cdd-cpp".to_string(),
+            make_process_config(
+                Some("sh"),
+                Some(vec![
+                    "-c",
+                    r#"while read line; do echo '{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"openapi: 3.2.0"}]},"id":10}'; done"#,
+                ]),
+                0,
+                10,
+                5000,
+            ),
+        );
+        configs.insert(
+            "cdd-rust".to_string(),
+            make_process_config(
+                Some("sh"),
+                Some(vec![
+                    "-c",
+                    r#"while read line; do echo '{"jsonrpc":"2.0","result":{"status":"rust_ok"},"id":10}'; done"#,
+                ]),
+                0,
+                10,
+                5000,
+            ),
+        );
+
+        let pm = ProcessManager::new(configs);
+        pm.start_all().await;
+
+        // 1. Target `rust` with Google Discovery input -> pre-converts via `cdd-cpp`, then calls `cdd-rust`
+        let rust_query = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "cdd_generate_sdk",
+                "arguments": {
+                    "target_language": "rust",
+                    "input": discovery_yaml,
+                    "target": "to_sdk",
+                    "mcp": true,
+                    "framework": "axum"
+                }
+            })),
+            id: Some(RequestId::Number(10)),
+        };
+        let rust_reply = pm.handle_request(rust_query).await?;
+        assert_eq!(
+            rust_reply.result,
+            Some(serde_json::json!({"status": "rust_ok"}))
+        );
+
+        // 2. Target `cpp` with `to_docs_json` -> also triggers pre-conversion
+        let cpp_docs_query = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "cdd_generate_sdk",
+                "arguments": {
+                    "target_language": "cpp",
+                    "input": discovery_yaml,
+                    "target": "to_docs_json"
+                }
+            })),
+            id: Some(RequestId::Number(10)),
+        };
+        let cpp_docs_reply = pm.handle_request(cpp_docs_query).await?;
+        assert!(cpp_docs_reply.result.is_some());
+
+        // 3. Target `cpp` with `to_sdk` -> goes directly to `cdd-cpp` without extra conversion hop
+        let cpp_direct_query = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "cdd_generate_sdk",
+                "arguments": {
+                    "target_language": "cpp",
+                    "input": discovery_yaml,
+                    "target": "to_sdk"
+                }
+            })),
+            id: Some(RequestId::Number(10)),
+        };
+        let cpp_direct_reply = pm.handle_request(cpp_direct_query).await?;
+        assert!(cpp_direct_reply.result.is_some());
+
+        pm.stop_all().await;
+        Ok(())
+    }
+
+    /// Verifies error propagation when `cdd-cpp` daemon returns an error or empty content
+    /// during Google Discovery v1 pre-conversion.
+    #[tokio::test]
+    async fn test_daemon_google_discovery_preconversion_errors() {
+        let discovery_yaml = "discoveryVersion: v1\nname: compute\n";
+
+        // 4. Test when `cdd-cpp` returns a JSON-RPC error object during pre-conversion
+        let mut err_configs = HashMap::new();
+        err_configs.insert(
+            "cdd-cpp".to_string(),
+            make_process_config(
+                Some("sh"),
+                Some(vec![
+                    "-c",
+                    r#"while read line; do echo '{"jsonrpc":"2.0","error":{"code":-32000,"message":"cpp failed"},"id":11}'; done"#,
+                ]),
+                0,
+                10,
+                5000,
+            ),
+        );
+        let pm_err = ProcessManager::new(err_configs);
+        pm_err.start_all().await;
+        let req_err = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "arguments": {
+                    "target_language": "rust",
+                    "input": discovery_yaml
+                }
+            })),
+            id: Some(RequestId::Number(11)),
+        };
+        assert!(matches!(
+            pm_err.handle_request(req_err).await,
+            Err(CddEngineError::Mcp(_))
+        ));
+        pm_err.stop_all().await;
+
+        // 5. Test when `cdd-cpp` returns empty content during pre-conversion
+        let mut empty_configs = HashMap::new();
+        empty_configs.insert(
+            "cdd-cpp".to_string(),
+            make_process_config(
+                Some("sh"),
+                Some(vec![
+                    "-c",
+                    r#"while read line; do echo '{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"   "}]},"id":12}'; done"#,
+                ]),
+                0,
+                10,
+                5000,
+            ),
+        );
+        let pm_empty = ProcessManager::new(empty_configs);
+        pm_empty.start_all().await;
+        let req_empty = McpRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "arguments": {
+                    "target_language": "rust",
+                    "input": discovery_yaml
+                }
+            })),
+            id: Some(RequestId::Number(12)),
+        };
+        assert!(matches!(
+            pm_empty.handle_request(req_empty).await,
+            Err(CddEngineError::Mcp(_))
+        ));
+        pm_empty.stop_all().await;
     }
 
     /// Verifies retry exhaustion, stability threshold reset, and shutdown during retry delay.

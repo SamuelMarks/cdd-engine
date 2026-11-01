@@ -73,11 +73,33 @@ manager.stop_all().await;
 ## 4. Executing WebAssembly Generators (`NativeWasmExecutor`)
 
 ```rust
-use cdd_engine::{NativeWasmExecutor, WasmExecutor};
+use cdd_engine::{
+    CompilerOptions, GeneratorTarget, NativeWasmExecutor, RepoLayoutConfig, RepoLayoutMode,
+    TargetLanguage, WasmExecutor,
+};
 
 let executor = NativeWasmExecutor::new()?;
-let generated_files = executor.execute("rust", r#"{"openapi":"3.1.0"}"#, &[])?;
+
+// Single target execution with strongly typed CompilerOptions and automatic SpecFormat detection
+let options = CompilerOptions {
+    target: GeneratorTarget::ToServer,
+    mcp: true,
+    framework: Some("axum".to_string()),
+    tests: true,
+    ..CompilerOptions::default()
+};
+let generated_files =
+    executor.execute_with_options("rust", r#"{"openapi":"3.2.0"}"#, &options)?;
 for file in generated_files {
     println!("Generated {}: {} bytes", file.path, file.content.len());
 }
+
+// Multi-language batch execution with Monorepo or Polyrepo partitioning
+let layout = RepoLayoutConfig::new("acme", RepoLayoutMode::Monorepo)?;
+let batch_files = executor.execute_batch(
+    &TargetLanguage::all_standard(),
+    r#"{"openapi":"3.2.0"}"#,
+    &options,
+    &layout,
+)?;
 ```
